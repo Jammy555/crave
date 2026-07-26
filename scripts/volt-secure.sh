@@ -4,30 +4,24 @@
 #  LunarisOS Build & Upload Automation Script  —  SECURED version for GitHub Actions
 # =============================================================================
 #
-#  This is a SECURED fork of volt.sh. The ONLY changes are:
-#    - Credentials (Telegram bot token, chat ID, zdrive API key) are read from
-#      ENVIRONMENT VARIABLES instead of hardcoded base64 strings.
-#    - Build flags (--nosync, --reset, --tree1=, --tree2=, --manifest-branch=,
-#      modules) can also be passed via environment variables (for GitHub Actions
-#      workflow_dispatch inputs), OR via CLI args exactly like the original.
-#
-#  EVERYTHING ELSE — sync logic, tree cloning, module parsing, build polling,
-#  progress bars, upload logic, error handling — is IDENTICAL to the original.
-#
 #  REQUIRED ENVIRONMENT VARIABLES (set by GitHub Actions from secrets):
 #    TELEGRAM_BOT_TOKEN  — your Telegram bot token
 #    TELEGRAM_CHAT_ID    — your Telegram chat/user ID
 #    ZDRIVE_API_KEY      — your zdrive (zincdrive.com) API key
 #
 #  OPTIONAL ENVIRONMENT VARIABLES (set by GitHub Actions workflow inputs):
-#    INPUT_SKIP_SYNC       — "true" to skip sync (same as --nosync)
-#    INPUT_RUN_RESET       — "true" to hard-reset repos (same as --reset)
-#    INPUT_BUILD_MODULE    — what to build, default "bacon"
-#    INPUT_TREE1_SWITCH    — "name:branch" (same as --tree1=name:branch)
-#    INPUT_TREE2_SWITCH    — "name:branch" (same as --tree2=name:branch)
-#    INPUT_MANIFEST_BRANCH — override manifest branch (same as --manifest-branch=)
+#    INPUT_SKIP_SYNC        — "true" to skip sync
+#    INPUT_RUN_RESET        — "true" to hard-reset repos
+#    INPUT_BUILD_MODULE     — what to build, default "bacon"
+#    INPUT_TREE_OVERRIDES   — comma-separated branch overrides, e.g.
+#                             "kernel:test,device:main,vendor:test"
+#                             Only listed trees are overridden; others use defaults.
+#    INPUT_MANIFEST_BRANCH  — override manifest branch
 #
-#  See the original volt.sh for full documentation of the build logic.
+#  CLI USAGE (for manual runs):
+#    bash volt-secure.sh [flags] [module1] [-module2]
+#    Flags: --nosync, --reset, --tree1=name:branch, --tree2=name:branch,
+#           --manifest-branch=X, -h/--help
 # =============================================================================
 
 # ---- Safety belts -----------------------------------------------------------
@@ -38,7 +32,6 @@ set -m
 # =============================================================================
 # CREDENTIALS — from environment, NOT hardcoded
 # =============================================================================
-# :? means "fail immediately with this message if the variable is unset or empty"
 TELEGRAM_TOKEN="${TELEGRAM_BOT_TOKEN:?'ERROR: TELEGRAM_BOT_TOKEN not set. Add it to GitHub Secrets.'}"
 TELEGRAM_CHAT="${TELEGRAM_CHAT_ID:?'ERROR: TELEGRAM_CHAT_ID not set. Add it to GitHub Secrets.'}"
 ZDRIVE_KEY="${ZDRIVE_API_KEY:?'ERROR: ZDRIVE_API_KEY not set. Add it to GitHub Secrets.'}"
@@ -69,6 +62,11 @@ declare -A TREE_LOOKUP=(
     [dolby]="https://github.com/Jammy555/vendor_oneplus_dolby.git|./vendor/sony/dolby|dolby|D2"
     [pixelworks]="https://github.com/LineageOS/android_hardware_pixelworks_interfaces.git|hardware/pixelworks/interfaces|pixelworks|lineage-23.2"
 )
+
+# --- Branch override map (populated from INPUT_TREE_OVERRIDES or --tree1/2) --
+# If a tree name has an entry here, clone_default() uses THIS branch instead
+# of the default from TREE_LOOKUP.
+declare -A BRANCH_OVERRIDES=()
 
 # --- Tunables ---------------------------------------------------------------
 POLL_INTERVAL_SECONDS=15
@@ -113,8 +111,6 @@ print_usage() {
 cat <<'USAGE_EOF'
 LunarisOS build script (volt-secure.sh) — SECURED version
 
-  Can be run via GitHub Actions (reads INPUT_* env vars) OR via CLI:
-
   bash volt-secure.sh [flags] [module1] [-module2]
 
   REQUIRED ENVIRONMENT VARIABLES:
@@ -122,29 +118,29 @@ LunarisOS build script (volt-secure.sh) — SECURED version
     TELEGRAM_CHAT_ID     Your Telegram chat/user ID
     ZDRIVE_API_KEY       Your zdrive API key
 
-FLAGS (same as original volt.sh)
-  --nosync                      Skip syncing + cloning, rebuild from disk.
+FLAGS
+  --nosync                      Skip syncing + cloning.
   --reset[=<paths>]             Hard reset repos.
-  --tree1=<name>:<branch>       Switch ONE tree to a different branch.
-  --tree2=<name>:<branch>       A second tree switch.
-  --manifest-branch=<branch>    Override the ROM manifest branch.
-  -h, --help                    Show this help and exit.
+  --tree1=<name>:<branch>       Switch ONE tree (CLI only).
+  --tree2=<name>:<branch>       Second tree switch (CLI only).
+  --manifest-branch=<branch>    Override manifest branch.
+  -h, --help                    Show this help.
 
-MODULES — max 2 per run
-  Same as original volt.sh. Default: "bacon"
+ENVIRONMENT VARIABLE OVERRIDES (GitHub Actions):
+  INPUT_SKIP_SYNC=true
+  INPUT_RUN_RESET=true
+  INPUT_BUILD_MODULE="bacon"
+  INPUT_TREE_OVERRIDES="kernel:test,device:main,vendor:test"
+  INPUT_MANIFEST_BRANCH="16.2"
 
-ENVIRONMENT VARIABLE OVERRIDES (for GitHub Actions):
-  INPUT_SKIP_SYNC=true          Same as --nosync
-  INPUT_RUN_RESET=true          Same as --reset
-  INPUT_BUILD_MODULE="bacon"    Module to build
-  INPUT_TREE1_SWITCH="k:b"     Same as --tree1=k:b
-  INPUT_TREE2_SWITCH="k:b"     Same as --tree2=k:b
-  INPUT_MANIFEST_BRANCH="16.2" Same as --manifest-branch=16.2
+VALID TREE NAMES for overrides:
+  kernel, device, common, hardware, vendor, vendor-common,
+  camera, dolby, pixelworks
 USAGE_EOF
 }
 
 # =============================================================================
-# ARGUMENT PARSING — supports both CLI args AND env var overrides
+# ARGUMENT PARSING
 # =============================================================================
 SKIP_SYNC=0
 RUN_RESET=0
@@ -159,37 +155,34 @@ if [[ "${INPUT_RUN_RESET:-}" == "true" ]]; then
     RUN_RESET=1
 fi
 
-# Parse --tree1 from env var
-if [[ -n "${INPUT_TREE1_SWITCH:-}" ]]; then
-    _t="${INPUT_TREE1_SWITCH}"
-    TREE1_NAME="${_t%%:*}"; TREE1_NAME="${TREE1_NAME,,}"
-    TREE1_BRANCH="${_t#*:}"
-    if [[ "$TREE1_NAME" == "${_t,,}" || -z "$TREE1_BRANCH" ]]; then
-        echo "ERROR: INPUT_TREE1_SWITCH needs the form name:branch, e.g. kernel:test" >&2
-        exit 1
-    fi
-    if [[ -z "${TREE_LOOKUP[$TREE1_NAME]:-}" ]]; then
-        echo "ERROR: unknown tree '${TREE1_NAME}' in INPUT_TREE1_SWITCH. Valid: ${!TREE_LOOKUP[*]}" >&2
-        exit 1
-    fi
+# Parse INPUT_TREE_OVERRIDES — comma-separated "name:branch" pairs
+# e.g. "kernel:test,device:main,vendor:test"
+# These override the default branch in TREE_LOOKUP during step 2 (clone).
+if [[ -n "${INPUT_TREE_OVERRIDES:-}" ]]; then
+    IFS=',' read -ra _overrides <<< "$INPUT_TREE_OVERRIDES"
+    for _entry in "${_overrides[@]}"; do
+        # Trim whitespace
+        _entry=$(echo "$_entry" | xargs)
+        [[ -z "$_entry" ]] && continue
+
+        _oname="${_entry%%:*}"
+        _oname="${_oname,,}"  # lowercase
+        _obranch="${_entry#*:}"
+
+        if [[ "$_oname" == "${_entry,,}" || -z "$_obranch" ]]; then
+            echo "ERROR: TREE_OVERRIDES entry '${_entry}' needs the form name:branch" >&2
+            exit 1
+        fi
+        if [[ -z "${TREE_LOOKUP[$_oname]:-}" ]]; then
+            echo "ERROR: unknown tree '${_oname}' in TREE_OVERRIDES. Valid: ${!TREE_LOOKUP[*]}" >&2
+            exit 1
+        fi
+        BRANCH_OVERRIDES[$_oname]="$_obranch"
+        echo "  Tree override: ${_oname} → ${_obranch}"
+    done
 fi
 
-# Parse --tree2 from env var
-if [[ -n "${INPUT_TREE2_SWITCH:-}" ]]; then
-    _t="${INPUT_TREE2_SWITCH}"
-    TREE2_NAME="${_t%%:*}"; TREE2_NAME="${TREE2_NAME,,}"
-    TREE2_BRANCH="${_t#*:}"
-    if [[ "$TREE2_NAME" == "${_t,,}" || -z "$TREE2_BRANCH" ]]; then
-        echo "ERROR: INPUT_TREE2_SWITCH needs the form name:branch, e.g. vendor:test" >&2
-        exit 1
-    fi
-    if [[ -z "${TREE_LOOKUP[$TREE2_NAME]:-}" ]]; then
-        echo "ERROR: unknown tree '${TREE2_NAME}' in INPUT_TREE2_SWITCH. Valid: ${!TREE_LOOKUP[*]}" >&2
-        exit 1
-    fi
-fi
-
-# Then parse CLI args (override env vars if both are given)
+# Then parse CLI args (--tree1/--tree2 still supported for manual runs)
 for arg in "$@"; do
     case "$arg" in
         -h|--help)
@@ -207,12 +200,10 @@ for arg in "$@"; do
             TREE1_NAME="${_t%%:*}"; TREE1_NAME="${TREE1_NAME,,}"
             TREE1_BRANCH="${_t#*:}"
             if [[ "$TREE1_NAME" == "${_t,,}" || -z "$TREE1_BRANCH" ]]; then
-                echo "ERROR: --tree1 needs the form name:branch, e.g. --tree1=kernel:test" >&2
-                exit 1
+                echo "ERROR: --tree1 needs the form name:branch" >&2; exit 1
             fi
             if [[ -z "${TREE_LOOKUP[$TREE1_NAME]:-}" ]]; then
-                echo "ERROR: unknown tree '${TREE1_NAME}' in --tree1. Valid: ${!TREE_LOOKUP[*]}" >&2
-                exit 1
+                echo "ERROR: unknown tree '${TREE1_NAME}'. Valid: ${!TREE_LOOKUP[*]}" >&2; exit 1
             fi
             ;;
         --tree2=*)
@@ -220,12 +211,10 @@ for arg in "$@"; do
             TREE2_NAME="${_t%%:*}"; TREE2_NAME="${TREE2_NAME,,}"
             TREE2_BRANCH="${_t#*:}"
             if [[ "$TREE2_NAME" == "${_t,,}" || -z "$TREE2_BRANCH" ]]; then
-                echo "ERROR: --tree2 needs the form name:branch, e.g. --tree2=vendor:test" >&2
-                exit 1
+                echo "ERROR: --tree2 needs the form name:branch" >&2; exit 1
             fi
             if [[ -z "${TREE_LOOKUP[$TREE2_NAME]:-}" ]]; then
-                echo "ERROR: unknown tree '${TREE2_NAME}' in --tree2. Valid: ${!TREE_LOOKUP[*]}" >&2
-                exit 1
+                echo "ERROR: unknown tree '${TREE2_NAME}'. Valid: ${!TREE_LOOKUP[*]}" >&2; exit 1
             fi
             ;;
         *)
@@ -234,8 +223,7 @@ for arg in "$@"; do
 done
 
 if [[ -n "$TREE1_NAME" && -n "$TREE2_NAME" && "$TREE1_NAME" == "$TREE2_NAME" ]]; then
-    echo "ERROR: --tree1 and --tree2 both target '${TREE1_NAME}' — that's just one tree switched twice, wasting a clone. Pick two different trees, or drop one flag." >&2
-    exit 1
+    echo "ERROR: --tree1 and --tree2 both target '${TREE1_NAME}'" >&2; exit 1
 fi
 
 # =============================================================================
@@ -244,7 +232,6 @@ fi
 BUILD_MODULES=()
 CURRENT_MODULE=""
 
-# If no CLI module args, check env var
 if [[ ${#CLEAN_ARGS[@]} -eq 0 && -n "${INPUT_BUILD_MODULE:-}" ]]; then
     CLEAN_ARGS=("${INPUT_BUILD_MODULE}")
 fi
@@ -270,12 +257,11 @@ if [[ ${#BUILD_MODULES[@]} -eq 0 ]]; then
     BUILD_MODULES=("bacon")
 fi
 if [[ ${#BUILD_MODULES[@]} -gt $MAX_MODULES ]]; then
-    echo "ERROR: ${#BUILD_MODULES[@]} modules given, but max is ${MAX_MODULES}. Trim it down and re-run." >&2
-    exit 1
+    echo "ERROR: ${#BUILD_MODULES[@]} modules given, max is ${MAX_MODULES}." >&2; exit 1
 fi
 
 # =============================================================================
-# TELEGRAM HELPERS — uses $TELEGRAM_TOKEN and $TELEGRAM_CHAT directly
+# TELEGRAM HELPERS
 # =============================================================================
 
 update_tg_status() {
@@ -368,7 +354,7 @@ send_telegram_file() {
 }
 
 # =============================================================================
-# ERROR HANDLING — identical logic to original volt.sh
+# ERROR HANDLING
 # =============================================================================
 
 die() {
@@ -394,14 +380,14 @@ on_exit() {
 
     if [[ $INTERRUPTED -eq 1 ]]; then
         mark_step_complete "🛑 Cancelled during: ${CURRENT_STAGE}"
-        update_tg_status "Cancelled 🛑" "⚠️ Build manually stopped ( kill / Telegram) during: ${CURRENT_STAGE}"
-        [[ -n "$CURRENT_LOG_FILE" ]] && send_telegram_file "$CURRENT_LOG_FILE" "📄 Log at the moment of cancellation"
+        update_tg_status "Cancelled 🛑" "⚠️ Build manually stopped during: ${CURRENT_STAGE}"
+        [[ -n "$CURRENT_LOG_FILE" ]] && send_telegram_file "$CURRENT_LOG_FILE" "📄 Log at cancellation"
     elif [[ -n "$FAILURE_REASON" ]]; then
         mark_step_complete "❌ Failed during: ${CURRENT_STAGE}"
         update_tg_status "Build Failed ❌" "🚨 ${FAILURE_REASON} — during: ${CURRENT_STAGE}"
         [[ -n "$CURRENT_LOG_FILE" ]] && send_telegram_file "$CURRENT_LOG_FILE" "📄 Log from: ${CURRENT_STAGE}"
     elif [[ $exit_code -ne 0 ]]; then
-        update_tg_status "Finished, with failures ⚠️" "⚠️ ${MODULE_FAILURE_COUNT} module(s) failed — see above for which ones, and their logs."
+        update_tg_status "Finished, with failures ⚠️" "⚠️ ${MODULE_FAILURE_COUNT} module(s) failed."
     else
         mark_step_complete "✅ <b>All modules finished successfully</b>"
         update_tg_status "Finished 🎉" "✅ All queued build modules completed."
@@ -452,6 +438,8 @@ smart_clone() {
     fi
 }
 
+# Clones a tree using its default branch from TREE_LOOKUP, UNLESS there's
+# an override in BRANCH_OVERRIDES (set by INPUT_TREE_OVERRIDES env var).
 clone_default() {
     local key="$1"
     local lookup="${TREE_LOOKUP[$key]}"
@@ -459,9 +447,18 @@ clone_default() {
     local target_dir="${rest%%|*}"; rest="${rest#*|}"
     local display_name="${rest%%|*}"
     local default_branch="${rest#*|}"
-    smart_clone "$repo_url" "$default_branch" "$target_dir" "$display_name"
+
+    # Use override branch if one was specified for this tree
+    local branch="${BRANCH_OVERRIDES[$key]:-$default_branch}"
+
+    if [[ "$branch" != "$default_branch" ]]; then
+        update_tg_status "Cloning Trees 🌲" "⏳ ${display_name}: using override branch '${branch}' (default was '${default_branch}')..."
+    fi
+
+    smart_clone "$repo_url" "$branch" "$target_dir" "$display_name"
 }
 
+# Switches ONE tree to an EXPLICIT branch (used by CLI --tree1/--tree2).
 switch_tree() {
     local tree_key="$1"
     local new_branch="$2"
@@ -511,9 +508,9 @@ start_build_process() {
             > out/repo_init.log 2>&1
         local REPO_INIT_STATUS=$?
         if [[ $REPO_INIT_STATUS -eq 124 ]]; then
-            die "repo init timed out after ${REPO_INIT_TIMEOUT_SECONDS}s (looks stuck, not a normal failure) — check MANIFEST_URL / manifest branch '${MANIFEST_BRANCH}'"
+            die "repo init timed out after ${REPO_INIT_TIMEOUT_SECONDS}s"
         elif [[ $REPO_INIT_STATUS -ne 0 ]]; then
-            die "repo init failed (exit ${REPO_INIT_STATUS}) — check MANIFEST_URL / manifest branch '${MANIFEST_BRANCH}'"
+            die "repo init failed (exit ${REPO_INIT_STATUS})"
         fi
         CURRENT_LOG_FILE=""
 
@@ -529,21 +526,32 @@ start_build_process() {
         elif [[ -s "$SYNC_HISTORY_FILE" ]]; then
             local failing_repos
             failing_repos=$(grep -iE "error:|fatal:|cannot fetch|failed to sync|cannot checkout" out/resync.log | sort -u | head -20)
-            mark_step_complete "⚠️ resync.sh reported errors after $(elapsed_since_step) (continuing — last known-good sync: $(tail -1 "$SYNC_HISTORY_FILE"))"
-            update_tg_status "Resync Warning ⚠️" "⚠️ resync.sh hit an error, but this tree synced fine before — continuing with what's on disk.
-${failing_repos:-(no specific repo names matched — see attached log)}"
-            send_telegram_file "out/resync.log" "📄 resync.sh output (failed, but a prior sync exists — continuing)"
+            mark_step_complete "⚠️ resync.sh reported errors after $(elapsed_since_step) (continuing — last good sync: $(tail -1 "$SYNC_HISTORY_FILE"))"
+            update_tg_status "Resync Warning ⚠️" "⚠️ resync.sh hit an error, continuing with what's on disk.
+${failing_repos:-(see attached log)}"
+            send_telegram_file "out/resync.log" "📄 resync.sh output (failed, but prior sync exists)"
             CURRENT_LOG_FILE=""
         elif [[ $RESYNC_STATUS -eq 124 ]]; then
-            die "resync.sh timed out after ${RESYNC_TIMEOUT_SECONDS}s (looks stuck — no prior sync here to fall back on, so stopping rather than guessing)"
+            die "resync.sh timed out after ${RESYNC_TIMEOUT_SECONDS}s"
         else
-            die "resync.sh failed (no prior successful sync recorded here — this looks like a genuinely fresh sync issue, not a transient one)"
+            die "resync.sh failed (no prior successful sync)"
         fi
 
         mark_step_complete "✅ Sources Synced ($(elapsed_since_step))"
 
         # --- STEP 2: CLONE OR UPDATE DEVICE TREES ---
+        # clone_default() automatically uses BRANCH_OVERRIDES if set
         step_start
+
+        # Log which overrides are active
+        if [[ ${#BRANCH_OVERRIDES[@]} -gt 0 ]]; then
+            local override_summary=""
+            for _ok in "${!BRANCH_OVERRIDES[@]}"; do
+                override_summary="${override_summary} ${_ok}→${BRANCH_OVERRIDES[$_ok]}"
+            done
+            update_tg_status "Cloning Trees 🌲" "⏳ Active branch overrides:${override_summary}"
+        fi
+
         clone_default kernel
         clone_default device
         clone_default common
@@ -566,7 +574,16 @@ ${failing_repos:-(no specific repo names matched — see attached log)}"
         fi
         smart_clone "https://github.com/Jammy555/vendor_evolution-priv_keys-template.git" "master" "vendor/lineage-priv/keys" "lineage keys"
 
-        mark_step_complete "✅ Trees Cloned & Updated ($(elapsed_since_step))"
+        # Report overrides in the completion message
+        if [[ ${#BRANCH_OVERRIDES[@]} -gt 0 ]]; then
+            local ov_list=""
+            for _ok in "${!BRANCH_OVERRIDES[@]}"; do
+                ov_list="${ov_list}, ${_ok}:${BRANCH_OVERRIDES[$_ok]}"
+            done
+            mark_step_complete "✅ Trees Cloned & Updated ($(elapsed_since_step)) [overrides:${ov_list:2}]"
+        else
+            mark_step_complete "✅ Trees Cloned & Updated ($(elapsed_since_step))"
+        fi
     else
         mark_step_complete "⏩ <b>Sync & Clones Skipped</b> (--nosync)"
     fi
@@ -584,7 +601,7 @@ ${failing_repos:-(no specific repo names matched — see attached log)}"
     fi
     mark_step_complete "✅ Environment Ready ($(elapsed_since_step))"
 
-    # --- STEP 4: CLEAR STALE OUTPUT ---
+    # --- STEP 4: CLEAR STALE OUTPUT (mka installclean — NOT make clean!) ---
     step_start
     update_tg_status "Environment Setup 🛠" "⏳ Cleaning old target output (mka installclean)..."
     mka installclean
@@ -605,7 +622,7 @@ ${failing_repos:-(no specific repo names matched — see attached log)}"
         mark_step_complete "⏩ <b>Repository Reset Skipped</b>"
     fi
 
-    # --- STEP 6: ZDRIVE SETUP (uses $ZDRIVE_KEY from env, not hardcoded) ---
+    # --- STEP 6: ZDRIVE SETUP ---
     step_start
     update_tg_status "Upload Prep 📤" "⏳ Installing & configuring zdrive CLI..."
     if ! command -v zdrive &> /dev/null; then
@@ -616,7 +633,9 @@ ${failing_repos:-(no specific repo names matched — see attached log)}"
     zdrive setup "$ZDRIVE_KEY"
     mark_step_complete "✅ Upload Tool Ready ($(elapsed_since_step))"
 
-    # --- STEP 7: OPTIONAL TREE SWITCHES ---
+    # --- STEP 7: OPTIONAL TREE SWITCHES (CLI --tree1/--tree2 only) ---
+    # These are for manual CLI use. GitHub Actions uses TREE_OVERRIDES which
+    # applies during clone (step 2) and doesn't need a post-clone switch.
     if [[ -n "$TREE1_NAME" ]]; then
         switch_tree "$TREE1_NAME" "$TREE1_BRANCH"
     fi
@@ -638,7 +657,14 @@ ${failing_repos:-(no specific repo names matched — see attached log)}"
         touch out/.build_start_marker
         sleep 1
 
-        ( m $target_module 2>&1 | tee out/build.log ) &
+        # stdbuf -oL forces line-buffered output so the log file updates
+        # in real time for the progress parser below.
+        # Fall back to plain tee if stdbuf isn't available.
+        if command -v stdbuf &> /dev/null; then
+            ( m $target_module 2>&1 | stdbuf -oL tee out/build.log ) &
+        else
+            ( m $target_module 2>&1 | tee out/build.log ) &
+        fi
         BUILD_PID=$!
 
         local loop_count=0
@@ -663,8 +689,18 @@ ${failing_repos:-(no specific repo names matched — see attached log)}"
                 fi
             fi
 
+            # ── PROGRESS PARSING ──────────────────────────────────────
+            # Read a large chunk from the end of the log and look for
+            # ninja progress lines like: [ 23% 12345/53421] target C++: ...
+            #
+            # - tail -c 16000: read last 16KB (generous, catches progress
+            #   even with very long action descriptions between updates)
+            # - tr '\r' '\n': ninja uses \r to overwrite lines in terminal;
+            #   convert to real newlines so grep can match each update
+            # - grep WITHOUT ^ anchor: crave run may prefix lines with
+            #   extra output, so the [ may not be at column 0
             local latest_line
-            latest_line=$(tail -c 4000 out/build.log | tr '\r' '\n' | grep -E '^\[ *[0-9]{1,3}% [0-9]+/[0-9]+\]' | tail -n 1)
+            latest_line=$(tail -c 16000 out/build.log 2>/dev/null | tr '\r' '\n' | grep -E '\[ *[0-9]{1,3}% [0-9]+/[0-9]+\]' | tail -n 1)
 
             local current_status=""
             if [[ -z "$latest_line" ]] || { [[ "$latest_line" == *"[100% "* ]] && [[ $loop_count -lt $STARTUP_GRACE_POLLS ]]; }; then
@@ -675,12 +711,12 @@ ${failing_repos:-(no specific repo names matched — see attached log)}"
                 percent="${percent:-0}"
                 percent_num=$((10#$percent))
                 done_total=$(echo "$latest_line" | grep -oE '[0-9]+/[0-9]+' | head -n1)
-                action_desc=$(echo "$latest_line" | sed -E 's/^\[[^]]*\]\s*//' | cut -c1-90)
+                action_desc=$(echo "$latest_line" | sed -E 's/.*\] *//' | cut -c1-90)
                 bar=$(make_progress_bar "$percent_num")
 
                 eta_line=""
                 if (( percent_num > 0 )); then
-                    elapsed=$(( $(date +%s) - START_TIME ))
+                    elapsed=$(( $(date +%s) - STEP_START_TIME ))
                     local est_total est_remaining
                     est_total=$(( elapsed * 100 / percent_num ))
                     est_remaining=$(( est_total - elapsed ))
@@ -702,13 +738,13 @@ ${failing_repos:-(no specific repo names matched — see attached log)}"
 
         if [[ $BUILD_STATUS -ne 0 ]]; then
             MODULE_FAILURE_COUNT=$((MODULE_FAILURE_COUNT + 1))
-            mark_step_complete "❌ <b>${target_module}</b> (Failed to compile after $(elapsed_since_step), exit code ${BUILD_STATUS})"
-            update_tg_status "Module Failed ❌" "🚨 '${target_module}' failed (exit ${BUILD_STATUS}) — uploading its log, then continuing..."
+            mark_step_complete "❌ <b>${target_module}</b> (Failed after $(elapsed_since_step), exit ${BUILD_STATUS})"
+            update_tg_status "Module Failed ❌" "🚨 '${target_module}' failed (exit ${BUILD_STATUS})"
             send_telegram_file "out/build.log" "📄 Build error log: ${target_module} (exit ${BUILD_STATUS})"
             continue
         fi
 
-        # --- STEP 8, continued: SMART TARGET-AWARE UPLOAD ---
+        # --- UPLOAD ---
         update_tg_status "Uploading 📤" "⏳ Hunting for outputs from: ${target_module}..."
 
         local MODULE_LINKS=""

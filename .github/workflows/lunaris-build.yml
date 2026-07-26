@@ -13,6 +13,9 @@
 #   CUSTOM_YAML         — custom crave.yaml content
 #   PAID                — set to anything to use aosp-silver (paid builds)
 #
+# SECURITY: This workflow ONLY triggers on workflow_dispatch (manual run).
+# Pull requests CANNOT trigger it. Only users with write access can run it.
+#
 
 name: LunarisOS Build (Crave)
 
@@ -37,14 +40,8 @@ on:
         default: false
         type: boolean
 
-      TREE1_SWITCH:
-        description: 'Switch tree 1 (format: name:branch, e.g. kernel:test). Leave empty to skip.'
-        required: false
-        default: ''
-        type: string
-
-      TREE2_SWITCH:
-        description: 'Switch tree 2 (format: name:branch). Leave empty to skip.'
+      TREE_OVERRIDES:
+        description: 'Branch overrides for device trees (comma-separated). Example: kernel:test,device:main,vendor:test. Valid names: kernel, device, common, hardware, vendor, vendor-common, camera, dolby, pixelworks. Leave empty for defaults.'
         required: false
         default: ''
         type: string
@@ -131,40 +128,42 @@ jobs:
         fi
         echo "✅ All required secrets are configured"
 
-    - name: Validate tree switch format
+    - name: Validate tree overrides format
       run: |
-        TREE1="${{ github.event.inputs.TREE1_SWITCH }}"
-        TREE2="${{ github.event.inputs.TREE2_SWITCH }}"
+        OVERRIDES="${{ github.event.inputs.TREE_OVERRIDES }}"
         VALID_TREES="kernel device common hardware vendor vendor-common camera dolby pixelworks"
 
-        validate_tree() {
-          local input="$1"
-          local label="$2"
-          if [[ -z "$input" ]]; then return 0; fi
-          if [[ "$input" != *":"* ]]; then
-            echo "::error::${label} must be in format name:branch (e.g. kernel:test)"
-            exit 1
-          fi
-          local name="${input%%:*}"
-          name="${name,,}"
-          if ! echo "$VALID_TREES" | grep -qw "$name"; then
-            echo "::error::${label}: unknown tree '${name}'. Valid: ${VALID_TREES}"
-            exit 1
-          fi
-          echo "✅ ${label} = ${input}"
-        }
-
-        validate_tree "$TREE1" "TREE1_SWITCH"
-        validate_tree "$TREE2" "TREE2_SWITCH"
-
-        if [[ -n "$TREE1" && -n "$TREE2" ]]; then
-          t1="${TREE1%%:*}"; t1="${t1,,}"
-          t2="${TREE2%%:*}"; t2="${t2,,}"
-          if [[ "$t1" == "$t2" ]]; then
-            echo "::error::TREE1 and TREE2 both target '${t1}' — pick two different trees"
-            exit 1
-          fi
+        if [[ -z "$OVERRIDES" ]]; then
+          echo "✅ No tree overrides — using all defaults"
+          exit 0
         fi
+
+        IFS=',' read -ra ENTRIES <<< "$OVERRIDES"
+        for entry in "${ENTRIES[@]}"; do
+          entry=$(echo "$entry" | xargs)  # trim whitespace
+          [[ -z "$entry" ]] && continue
+
+          if [[ "$entry" != *":"* ]]; then
+            echo "::error::Tree override '$entry' must be in format name:branch (e.g. kernel:test)"
+            exit 1
+          fi
+
+          name="${entry%%:*}"
+          name="${name,,}"
+          branch="${entry#*:}"
+
+          if [[ -z "$branch" ]]; then
+            echo "::error::Tree override '$entry' has empty branch"
+            exit 1
+          fi
+
+          if ! echo "$VALID_TREES" | grep -qw "$name"; then
+            echo "::error::Unknown tree '$name'. Valid: $VALID_TREES"
+            exit 1
+          fi
+
+          echo "✅ Override: $name → $branch"
+        done
 
     - name: Display Build Configuration
       run: |
@@ -172,8 +171,7 @@ jobs:
         echo "Build Module:     ${{ github.event.inputs.BUILD_MODULE }}"
         echo "Skip Sync:        ${{ github.event.inputs.SKIP_SYNC }}"
         echo "Run Reset:        ${{ github.event.inputs.RUN_RESET }}"
-        echo "Tree 1 Switch:    ${{ github.event.inputs.TREE1_SWITCH || 'none' }}"
-        echo "Tree 2 Switch:    ${{ github.event.inputs.TREE2_SWITCH || 'none' }}"
+        echo "Tree Overrides:   ${{ github.event.inputs.TREE_OVERRIDES || 'none (all defaults)' }}"
         echo "Manifest Branch:  ${{ github.event.inputs.MANIFEST_BRANCH }}"
         echo "Max Retries:      ${{ github.event.inputs.MAX_RETRIES }}"
         echo "::endgroup::"
@@ -191,13 +189,9 @@ jobs:
 
     steps:
     # ─── FIND OR CREATE THE PROJECT CLONE ─────────────────────────────
-    # 1. Check if any clone already exists (crave clone list)
-    # 2. If YES → use it as-is, don't touch it
-    # 3. If NO  → create one: crave clone create --projectID 93
-    # 4. NEVER destroy an existing clone
+    # Uses existing clone. Only creates if none exists. NEVER destroys.
     # ──────────────────────────────────────────────────────────────────
     - name: Find or create project clone
-      id: find-clone
       run: |
         echo "Checking for existing crave clones..."
         CLONE_PATH=$(crave clone list --json | jq -r '.clones[0]."Cloned At" // empty')
@@ -217,10 +211,20 @@ jobs:
     - name: Telegram — Build Queued
       continue-on-error: true
       run: |
+        OVERRIDES_DISPLAY="${{ github.event.inputs.TREE_OVERRIDES || 'all defaults' }}"
         curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=🚀 *LunarisOS Build Queued*%0A%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0ASkip Sync: ${{ github.event.inputs.SKIP_SYNC }}%0ATree1: ${{ github.event.inputs.TREE1_SWITCH || 'default' }}%0ATree2: ${{ github.event.inputs.TREE2_SWITCH || 'default' }}%0AProject: ${PROJECTFOLDER}%0AMax Retries: ${{ github.event.inputs.MAX_RETRIES }}%0A%0A[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+          --data-urlencode "text=🚀 *LunarisOS Build Queued*
+
+Module: ${{ github.event.inputs.BUILD_MODULE }}
+Skip Sync: ${{ github.event.inputs.SKIP_SYNC }}
+Tree Overrides: ${OVERRIDES_DISPLAY}
+Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
+Max Retries: ${{ github.event.inputs.MAX_RETRIES }}
+Project: ${PROJECTFOLDER}
+
+[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
           -d "parse_mode=Markdown" \
           -d "disable_web_page_preview=true"
       env:
@@ -233,14 +237,6 @@ jobs:
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
     # ─── THE MAIN BUILD WITH AUTO-RETRY ─────────────────────────────────
-    #
-    # If `crave run` fails INSTANTLY with "Build Failed: returned 1" and
-    # "Total time: 0s", it means crave itself had a hiccup — NOT a real
-    # build failure. In that case, we retry automatically.
-    #
-    # A REAL build failure (compilation error, etc.) will have a non-zero
-    # Total time and won't trigger a retry.
-    # ────────────────────────────────────────────────────────────────────
     - name: Build LunarisOS via volt-secure.sh (with auto-retry)
       run: |
         cd "$PROJECTFOLDER"
@@ -260,7 +256,6 @@ jobs:
           echo "========================================================================"
           echo ""
 
-          # Run crave and capture output to check for instant-failure pattern
           OUTFILE=$(mktemp)
           set +e
           crave ${{ secrets.CRAVE_FLAGS }} run --no-patch ${PAID_FLAG} -- "\
@@ -270,14 +265,12 @@ jobs:
             export INPUT_SKIP_SYNC='${INPUT_SKIP_SYNC}' && \
             export INPUT_RUN_RESET='${INPUT_RUN_RESET}' && \
             export INPUT_BUILD_MODULE='${INPUT_BUILD_MODULE}' && \
-            export INPUT_TREE1_SWITCH='${INPUT_TREE1_SWITCH}' && \
-            export INPUT_TREE2_SWITCH='${INPUT_TREE2_SWITCH}' && \
+            export INPUT_TREE_OVERRIDES='${INPUT_TREE_OVERRIDES}' && \
             export INPUT_MANIFEST_BRANCH='${INPUT_MANIFEST_BRANCH}' && \
             curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt-secure.sh | bash -s --" 2>&1 | tee "$OUTFILE"
           EXIT_CODE=${PIPESTATUS[0]}
           set -e
 
-          # Grab the tail to check for the instant-failure pattern
           TAIL_OUTPUT=$(tail -20 "$OUTFILE")
           rm -f "$OUTFILE"
 
@@ -287,7 +280,7 @@ jobs:
             exit 0
           fi
 
-          # Check: is this the INSTANT crave failure? (Total time: 0s)
+          # Check for instant crave failure (Total time: 0s)
           if echo "$TAIL_OUTPUT" | grep -q "Total time: 0s" && echo "$TAIL_OUTPUT" | grep -q "Build Failed"; then
             echo ""
             echo "⚠️  Instant crave failure detected (Total time: 0s) — attempt ${attempt}/${MAX_RETRIES}"
@@ -309,7 +302,7 @@ jobs:
               curl -s -X POST \
                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                -d "text=❌ *Crave keeps failing instantly*%0AAll ${MAX_RETRIES} attempts returned 'Total time: 0s'%0ASomething is wrong with crave/devspace." \
+                -d "text=❌ *Crave keeps failing instantly*%0AAll ${MAX_RETRIES} attempts exhausted." \
                 -d "parse_mode=Markdown" > /dev/null 2>&1 || true
 
               exit 1
@@ -317,8 +310,7 @@ jobs:
           else
             # Real build failure — don't retry
             echo ""
-            echo "❌ Real build failure on attempt ${attempt} (exit code: ${EXIT_CODE})"
-            echo "   Not retrying — this is a genuine error, not a crave glitch."
+            echo "❌ Real build failure on attempt ${attempt} (exit: ${EXIT_CODE})"
             exit $EXIT_CODE
           fi
         done
@@ -330,8 +322,7 @@ jobs:
         INPUT_SKIP_SYNC: ${{ github.event.inputs.SKIP_SYNC }}
         INPUT_RUN_RESET: ${{ github.event.inputs.RUN_RESET }}
         INPUT_BUILD_MODULE: ${{ github.event.inputs.BUILD_MODULE }}
-        INPUT_TREE1_SWITCH: ${{ github.event.inputs.TREE1_SWITCH }}
-        INPUT_TREE2_SWITCH: ${{ github.event.inputs.TREE2_SWITCH }}
+        INPUT_TREE_OVERRIDES: ${{ github.event.inputs.TREE_OVERRIDES }}
         INPUT_MANIFEST_BRANCH: ${{ github.event.inputs.MANIFEST_BRANCH }}
 
     # ─── POST-BUILD ─────────────────────────────────────────────────────
@@ -343,7 +334,7 @@ jobs:
         curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=✅ *LunarisOS Build Succeeded!*%0A%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A%0A[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+          -d "text=✅ *LunarisOS Build Succeeded!*%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
           -d "parse_mode=Markdown" \
           -d "disable_web_page_preview=true"
       env:
@@ -362,7 +353,7 @@ jobs:
         curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=${STATUS} *LunarisOS Build*%0A%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A%0A[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+          -d "text=${STATUS} *LunarisOS Build*%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
           -d "parse_mode=Markdown" \
           -d "disable_web_page_preview=true"
       env:
