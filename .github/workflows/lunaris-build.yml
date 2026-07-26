@@ -205,7 +205,7 @@ jobs:
     - name: Validate tree overrides
       run: |
         OVERRIDES="${{ github.event.inputs.TREE_OVERRIDES }}"
-        VALID="kernel device common hardware vendor vendor-common camera dolby pixelworks"
+        VALID="kernel device common device-common hardware vendor vendor-common camera dolby pixelworks"
         [[ -z "$OVERRIDES" ]] && { echo "✅ No overrides — using defaults"; exit 0; }
 
         IFS=',' read -ra ENTRIES <<< "$OVERRIDES"

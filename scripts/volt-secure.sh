@@ -167,6 +167,8 @@ if [[ -n "${INPUT_TREE_OVERRIDES:-}" ]]; then
 
         _oname="${_entry%%:*}"
         _oname="${_oname,,}"  # lowercase
+        _oname="${_oname//_/-}"
+        [[ "$_oname" == "device-common" ]] && _oname="common"
         _obranch="${_entry#*:}"
 
         if [[ "$_oname" == "${_entry,,}" || -z "$_obranch" ]]; then
@@ -174,7 +176,7 @@ if [[ -n "${INPUT_TREE_OVERRIDES:-}" ]]; then
             exit 1
         fi
         if [[ -z "${TREE_LOOKUP[$_oname]:-}" ]]; then
-            echo "ERROR: unknown tree '${_oname}' in TREE_OVERRIDES. Valid: ${!TREE_LOOKUP[*]}" >&2
+            echo "ERROR: unknown tree '${_oname}' in TREE_OVERRIDES. Valid: ${!TREE_LOOKUP[*]} device-common" >&2
             exit 1
         fi
         BRANCH_OVERRIDES[$_oname]="$_obranch"
@@ -423,6 +425,13 @@ smart_clone() {
     local branch="$2"
     local target_dir="$3"
     local comp_name="$4"
+
+    update_tg_status "Cloning Trees 🌲" "⏳ Verifying remote branch '${branch}' for ${comp_name}..."
+
+    # Check if the branch exists on remote repository
+    if ! git ls-remote --heads --exit-code "$repo_url" "$branch" &>/dev/null; then
+        die "Branch '${branch}' does NOT exist on remote repo for ${comp_name} (${repo_url})"
+    fi
 
     update_tg_status "Cloning Trees 🌲" "⏳ Fetching ${comp_name} (branch: ${branch})..."
 
