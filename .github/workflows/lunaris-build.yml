@@ -256,6 +256,14 @@ jobs:
         set +x
         cd "$PROJECTFOLDER"
 
+        # Write secrets to ~/.crave_env so crave CLI never logs raw tokens
+        cat <<EOF > $HOME/.crave_env
+        export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
+        export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
+        export ZDRIVE_API_KEY="${ZDRIVE_API_KEY}"
+        EOF
+        chmod 600 $HOME/.crave_env
+
         PAID_FLAG=""
         if [[ -n "${{ secrets.PAID }}" ]]; then
           PAID_FLAG="--platform aosp-silver"
@@ -274,9 +282,7 @@ jobs:
           OUTFILE=$(mktemp)
           set +e
           crave ${{ secrets.CRAVE_FLAGS }} run --no-patch ${PAID_FLAG} -- "\
-            export TELEGRAM_BOT_TOKEN=\"${TELEGRAM_BOT_TOKEN}\" && \
-            export TELEGRAM_CHAT_ID=\"${TELEGRAM_CHAT_ID}\" && \
-            export ZDRIVE_API_KEY=\"${ZDRIVE_API_KEY}\" && \
+            [ -f \$HOME/.crave_env ] && source \$HOME/.crave_env && \
             export INPUT_SKIP_SYNC='${INPUT_SKIP_SYNC}' && \
             export INPUT_RUN_RESET='${INPUT_RUN_RESET}' && \
             export INPUT_BUILD_MODULE='${INPUT_BUILD_MODULE}' && \
