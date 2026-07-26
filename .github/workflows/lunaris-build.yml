@@ -250,23 +250,10 @@ jobs:
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
-    # ── Write secrets safely to local file (never printed in logs) ──
-    - name: Prepare secret env file
-      run: |
-        cat <<EOF > $HOME/.volt_secrets
-        export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
-        export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
-        export ZDRIVE_API_KEY="${ZDRIVE_API_KEY}"
-        EOF
-        chmod 600 $HOME/.volt_secrets
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        ZDRIVE_API_KEY: ${{ secrets.ZDRIVE_API_KEY }}
-
     # ── THE BUILD — with auto-retry for instant crave failures ──
     - name: Run build (auto-retry on crave glitches)
       run: |
+        set +x
         cd "$PROJECTFOLDER"
 
         PAID_FLAG=""
@@ -287,7 +274,9 @@ jobs:
           OUTFILE=$(mktemp)
           set +e
           crave ${{ secrets.CRAVE_FLAGS }} run --no-patch ${PAID_FLAG} -- "\
-            [ -f \$HOME/.volt_secrets ] && source \$HOME/.volt_secrets && \
+            export TELEGRAM_BOT_TOKEN=\"${TELEGRAM_BOT_TOKEN}\" && \
+            export TELEGRAM_CHAT_ID=\"${TELEGRAM_CHAT_ID}\" && \
+            export ZDRIVE_API_KEY=\"${ZDRIVE_API_KEY}\" && \
             export INPUT_SKIP_SYNC='${INPUT_SKIP_SYNC}' && \
             export INPUT_RUN_RESET='${INPUT_RUN_RESET}' && \
             export INPUT_BUILD_MODULE='${INPUT_BUILD_MODULE}' && \
