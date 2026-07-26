@@ -95,21 +95,21 @@ jobs:
 
         status=0
         timeout 35s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
-          if [ -d ~/actions-runner ] && [ -f ~/actions-runner/run.sh ]; then
-            echo '✅ Runner binary found at ~/actions-runner'
+          if [ -d \$HOME/actions-runner ] && [ -f \$HOME/actions-runner/run.sh ]; then
+            echo '✅ Runner binary found at \$HOME/actions-runner'
             if tmux has-session -t ghactions 2>/dev/null && pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
               echo '✅ Self-hosted runner is active and listening for jobs'
             else
               echo '⚠️ Runner session dead or stopped. Restarting runner in tmux...'
               tmux kill-session -t ghactions 2>/dev/null || true
               tmux new-session -d -s ghactions
-              tmux send-keys -t ghactions 'cd ~/actions-runner && ./run.sh' Enter
+              tmux send-keys -t ghactions 'cd \$HOME/actions-runner && ./run.sh' Enter
               sleep 2
               echo '✅ Runner restarted in tmux session ghactions'
             fi
           elif [ -n \"$RUNNER_TOKEN\" ]; then
             echo '⚠️ Setting up new self-hosted runner with provided token...'
-            mkdir -p ~/actions-runner && cd ~/actions-runner
+            mkdir -p \$HOME/actions-runner && cd \$HOME/actions-runner
             RUNNER_VER=\$(curl -s 'https://api.github.com/repos/actions/runner/releases/latest' | grep -oP '\"tag_name\": \"v\K[^\"]*')
             curl -sL -o runner.tar.gz \"https://github.com/actions/runner/releases/download/v\${RUNNER_VER}/actions-runner-linux-x64-\${RUNNER_VER}.tar.gz\"
             tar xzf runner.tar.gz && rm -f runner.tar.gz
@@ -119,7 +119,7 @@ jobs:
             tmux send-keys -t ghactions './run.sh' Enter
             echo '✅ New runner installed and started'
           else
-            echo '❌ Runner not installed in ~/actions-runner and no RUNNER_TOKEN provided.'
+            echo '❌ Runner not installed in \$HOME/actions-runner and no RUNNER_TOKEN provided.'
             echo '   Please set up runner manually or supply RUNNER_TOKEN in workflow options.'
             exit 1
           fi
