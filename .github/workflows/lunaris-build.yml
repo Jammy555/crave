@@ -1,13 +1,9 @@
 #
 # ═══════════════════════════════════════════════════════════════════════
-#  LunarisOS Unified Build System
+#  LunarisOS Build System
 # ═══════════════════════════════════════════════════════════════════════
 #
-#  This is the ONLY workflow you need. It handles:
-#    1. Runner setup   — installs the runner if missing, auto-restarts if dead
-#    2. Clone mgmt     — finds existing crave clone, creates one only if needed
-#    3. Build          — runs volt-secure.sh via crave run with auto-retry
-#    4. Notifications  — Telegram status throughout
+#  This workflow runs directly on your self-hosted runner in crave devspace.
 #
 #  SECURITY: Only triggers on workflow_dispatch. PRs CANNOT run this.
 #
@@ -43,7 +39,7 @@ on:
         type: boolean
 
       TREE_OVERRIDES:
-        description: 'Branch overrides (comma-separated). Ex: kernel:test,device:main,vendor:test. Valid: kernel, device, common, hardware, vendor, vendor-common, camera, dolby, pixelworks'
+        description: 'Branch overrides (comma-separated). Ex: kernel:test,device:main,vendor:test. Valid: kernel, device, common, device-common, hardware, vendor, vendor-common, camera, dolby, pixelworks'
         required: false
         default: ''
         type: string
@@ -62,130 +58,7 @@ on:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════
-  # JOB 1: RUNNER MANAGEMENT
-  # Runs on GitHub cloud. Connects to crave devspace via SSH.
-  # Installs the runner if missing, restarts it if dead.
-  # ═══════════════════════════════════════════════════════════════════════
-  runner-setup:
-    name: "🔧 Runner Management"
-    runs-on: ubuntu-latest
-    steps:
-    - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y tmux jq
-
-    - name: Configure crave CLI
-      run: |
-        mkdir -p ${HOME}/bin/
-        curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
-        mv ${PWD}/crave ${HOME}/bin/ 2>/dev/null || true
-        sudo ln -sf ${HOME}/bin/crave /usr/bin/crave 2>/dev/null || true
-        cat <<EOF > ${HOME}/crave.conf
-        {
-          "username": "${CRAVE_USERNAME}",
-          "token": "${CRAVE_TOKEN}"
-        }
-        EOF
-      env:
-        CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
-        CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
-
-    # ── Get a fresh runner registration token via GitHub API ──
-    - name: Get runner registration token
-      id: reg-token
-      run: |
-        TOKEN=$(curl -s -X POST \
-          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
-          | jq -r '.token')
-
-        if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-          echo "::warning::Could not get registration token. Runner install/re-register won't work if runner is missing."
-          echo "GOT_TOKEN=false" >> "$GITHUB_OUTPUT"
-        else
-          echo "GOT_TOKEN=true" >> "$GITHUB_OUTPUT"
-          # Mask the token so it doesn't leak in logs
-          echo "::add-mask::$TOKEN"
-          echo "REG_TOKEN=$TOKEN" >> "$GITHUB_OUTPUT"
-        fi
-
-    # ── Connect to devspace and ensure runner is installed + running ──
-    - name: Ensure runner is installed and running
-      run: |
-        GOT_TOKEN="${{ steps.reg-token.outputs.GOT_TOKEN }}"
-        REG_TOKEN="${{ steps.reg-token.outputs.REG_TOKEN }}"
-        REPO="${{ github.repository }}"
-
-        crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
-          echo '══════════════════════════════════════════════'
-          echo '  RUNNER MANAGEMENT'
-          echo '══════════════════════════════════════════════'
-
-          # ── STEP 1: Check if runner is installed ──
-          if [ -f ~/actions-runner/run.sh ]; then
-            echo '✅ Runner binary found at ~/actions-runner/'
-          else
-            echo '⚠️ Runner not found. Installing...'
-
-            # Get latest runner version
-            RUNNER_VERSION=\$(curl -s 'https://api.github.com/repos/actions/runner/releases/latest' | grep -oP '\"tag_name\": \"v\K[^\"]*')
-            if [ -z \"\$RUNNER_VERSION\" ]; then
-              echo '❌ Failed to get runner version'
-              exit 1
-            fi
-            echo \"  Downloading runner v\$RUNNER_VERSION...\"
-
-            mkdir -p ~/actions-runner && cd ~/actions-runner
-            curl -sL -o runner.tar.gz \"https://github.com/actions/runner/releases/download/v\${RUNNER_VERSION}/actions-runner-linux-x64-\${RUNNER_VERSION}.tar.gz\"
-            tar xzf runner.tar.gz
-            rm -f runner.tar.gz
-
-            # Configure the runner (unattended)
-            if [ '${GOT_TOKEN}' = 'true' ]; then
-              echo '  Configuring runner...'
-              ./config.sh --unattended --url \"https://github.com/${REPO}\" --token \"${REG_TOKEN}\" --name crave-devspace --labels self-hosted,Linux,X64 --replace
-              echo '✅ Runner installed and configured'
-            else
-              echo '❌ Cannot configure runner — no registration token available'
-              echo '   Run this manually in devspace:'
-              echo '   cd ~/actions-runner && ./config.sh --url https://github.com/${REPO} --token <TOKEN>'
-              exit 1
-            fi
-
-            cd ~
-          fi
-
-          # ── STEP 2: Check if runner is running, start/restart if needed ──
-          if tmux has-session -t ghactions 2>/dev/null; then
-            # Check if the runner process is actually alive inside tmux
-            RUNNER_PID=\$(pgrep -f 'Runner.Listener' || true)
-            if [ -n \"\$RUNNER_PID\" ]; then
-              echo '✅ Runner is running (PID: '\$RUNNER_PID')'
-            else
-              echo '⚠️ tmux session exists but runner process is dead. Restarting...'
-              tmux kill-session -t ghactions 2>/dev/null || true
-              tmux new-session -d -s ghactions
-              tmux send-keys -t ghactions 'cd ~/actions-runner && ./run.sh' Enter
-              sleep 3
-              echo '✅ Runner restarted'
-            fi
-          else
-            echo '⚠️ No runner session found. Starting runner...'
-            tmux kill-session -t ghactions 2>/dev/null || true
-            tmux new-session -d -s ghactions
-            tmux send-keys -t ghactions 'cd ~/actions-runner && ./run.sh' Enter
-            sleep 3
-            echo '✅ Runner started in tmux session ghactions'
-          fi
-
-          echo ''
-          echo '══════════════════════════════════════════════'
-          echo '  RUNNER READY'
-          echo '══════════════════════════════════════════════'
-        "
-
-  # ═══════════════════════════════════════════════════════════════════════
-  # JOB 2: INPUT VALIDATION
+  # JOB 1: INPUT VALIDATION
   # Quick checks before the build starts.
   # ═══════════════════════════════════════════════════════════════════════
   validate:
@@ -230,14 +103,14 @@ jobs:
         echo "Max Retries:    ${{ github.event.inputs.MAX_RETRIES }}"
 
   # ═══════════════════════════════════════════════════════════════════════
-  # JOB 3: BUILD
+  # JOB 2: BUILD
   # Runs on the self-hosted runner inside crave devspace.
   # Finds/creates clone → crave run → auto-retry on instant failures.
   # ═══════════════════════════════════════════════════════════════════════
   build:
     name: "🔨 Build LunarisOS"
     timeout-minutes: 720
-    needs: [runner-setup, validate]
+    needs: [validate]
     runs-on: self-hosted
     concurrency:
       group: ${{ github.repository_owner }}
@@ -261,6 +134,7 @@ jobs:
 
         echo "PROJECTFOLDER=$CLONE_PATH" >> "$GITHUB_ENV"
 
+    # ── Notify via Telegram ──
     - name: Telegram — Build Started
       continue-on-error: true
       run: |
