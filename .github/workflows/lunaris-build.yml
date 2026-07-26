@@ -3,8 +3,6 @@
 #  LunarisOS Build System
 # ═══════════════════════════════════════════════════════════════════════
 #
-#  This workflow runs directly on your self-hosted runner in crave devspace.
-#
 #  SECURITY: Only triggers on workflow_dispatch. PRs CANNOT run this.
 #
 #  REQUIRED SECRETS:
@@ -56,9 +54,86 @@ on:
         default: '5'
         type: string
 
+      RUNNER_TOKEN:
+        description: 'Optional runner token (only needed if setting up a new runner from scratch)'
+        required: false
+        default: ''
+        type: string
+
 jobs:
   # ═══════════════════════════════════════════════════════════════════════
-  # JOB 1: INPUT VALIDATION
+  # JOB 1: SMART RUNNER DETECTION & AUTO-START
+  # Detects if runner is alive inside crave devspace; restarts if stopped;
+  # or sets up a new runner if RUNNER_TOKEN is provided.
+  # Uses 30s timeout so connection NEVER hangs.
+  # ═══════════════════════════════════════════════════════════════════════
+  runner-setup:
+    name: "🔧 Runner Check & Auto-Start"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+    - name: Configure crave CLI
+      run: |
+        mkdir -p ${HOME}/bin/
+        curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
+        mv ${PWD}/crave ${HOME}/bin/ 2>/dev/null || true
+        sudo ln -sf ${HOME}/bin/crave /usr/bin/crave 2>/dev/null || true
+        cat <<EOF > ${HOME}/crave.conf
+        {
+          "username": "${CRAVE_USERNAME}",
+          "token": "${CRAVE_TOKEN}"
+        }
+        EOF
+      env:
+        CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
+        CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
+
+    - name: Check and start self-hosted runner in crave devspace
+      run: |
+        RUNNER_TOKEN="${{ github.event.inputs.RUNNER_TOKEN }}"
+        REPO="${{ github.repository }}"
+
+        status=0
+        timeout 35s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
+          if [ -d ~/actions-runner ] && [ -f ~/actions-runner/run.sh ]; then
+            echo '✅ Runner binary found at ~/actions-runner'
+            if tmux has-session -t ghactions 2>/dev/null && pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
+              echo '✅ Self-hosted runner is active and listening for jobs'
+            else
+              echo '⚠️ Runner session dead or stopped. Restarting runner in tmux...'
+              tmux kill-session -t ghactions 2>/dev/null || true
+              tmux new-session -d -s ghactions
+              tmux send-keys -t ghactions 'cd ~/actions-runner && ./run.sh' Enter
+              sleep 2
+              echo '✅ Runner restarted in tmux session ghactions'
+            fi
+          elif [ -n \"$RUNNER_TOKEN\" ]; then
+            echo '⚠️ Setting up new self-hosted runner with provided token...'
+            mkdir -p ~/actions-runner && cd ~/actions-runner
+            RUNNER_VER=\$(curl -s 'https://api.github.com/repos/actions/runner/releases/latest' | grep -oP '\"tag_name\": \"v\K[^\"]*')
+            curl -sL -o runner.tar.gz \"https://github.com/actions/runner/releases/download/v\${RUNNER_VER}/actions-runner-linux-x64-\${RUNNER_VER}.tar.gz\"
+            tar xzf runner.tar.gz && rm -f runner.tar.gz
+            ./config.sh --unattended --url \"https://github.com/${REPO}\" --token \"$RUNNER_TOKEN\" --name crave-devspace --labels self-hosted,Linux,X64 --replace
+            tmux kill-session -t ghactions 2>/dev/null || true
+            tmux new-session -d -s ghactions
+            tmux send-keys -t ghactions './run.sh' Enter
+            echo '✅ New runner installed and started'
+          else
+            echo '❌ Runner not installed in ~/actions-runner and no RUNNER_TOKEN provided.'
+            echo '   Please set up runner manually or supply RUNNER_TOKEN in workflow options.'
+            exit 1
+          fi
+        " || status=$?
+
+        if [[ "$status" -eq 124 || "$status" -eq 0 ]]; then
+          echo "✅ Runner check/start finished."
+        else
+          echo "❌ Runner check failed (exit code: $status)"
+          exit $status
+        fi
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # JOB 2: INPUT VALIDATION
   # Quick checks before the build starts.
   # ═══════════════════════════════════════════════════════════════════════
   validate:
@@ -103,14 +178,14 @@ jobs:
         echo "Max Retries:    ${{ github.event.inputs.MAX_RETRIES }}"
 
   # ═══════════════════════════════════════════════════════════════════════
-  # JOB 2: BUILD
+  # JOB 3: BUILD
   # Runs on the self-hosted runner inside crave devspace.
   # Finds/creates clone → crave run → auto-retry on instant failures.
   # ═══════════════════════════════════════════════════════════════════════
   build:
     name: "🔨 Build LunarisOS"
     timeout-minutes: 720
-    needs: [validate]
+    needs: [runner-setup, validate]
     runs-on: self-hosted
     concurrency:
       group: ${{ github.repository_owner }}
