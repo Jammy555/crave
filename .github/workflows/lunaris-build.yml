@@ -201,17 +201,22 @@ jobs:
     # ── Find or create the project clone (NEVER destroys) ──
     - name: Find or create project clone
       run: |
-        echo "Checking for existing crave clones..."
-        CLONE_JSON=$(crave clone list --json 2>/dev/null || echo '{"clones":[]}')
-        CLONE_PATH=$(echo "$CLONE_JSON" | jq -r '.clones[0]."Cloned At" // empty')
+        echo "Checking for existing crave clones in /crave-devspaces/..."
+        CLONE_PATH=""
+        for d in /crave-devspaces/*; do
+          if [[ -d "$d" && "$d" != "/crave-devspaces/lost+found" ]]; then
+            CLONE_PATH="$d"
+            break
+          fi
+        done
 
         if [[ -n "$CLONE_PATH" && -d "$CLONE_PATH" ]]; then
-          echo "✅ Found existing clone: $CLONE_PATH"
+          echo "✅ Found existing clone at: $CLONE_PATH"
         else
           echo "⚠️ No clone found. Creating one..."
           CLONE_PATH="/crave-devspaces/Lineage22.1"
-          crave clone create --projectID 93 "$CLONE_PATH"
-          echo "✅ Created clone: $CLONE_PATH"
+          crave clone create --projectID 93 "$CLONE_PATH" || true
+          echo "✅ Clone ready at: $CLONE_PATH"
         fi
 
         echo "PROJECTFOLDER=$CLONE_PATH" >> "$GITHUB_ENV"
