@@ -81,7 +81,13 @@ jobs:
         cat <<EOF > ${HOME}/crave.conf
         {
           "username": "${CRAVE_USERNAME}",
-          "token": "${CRAVE_TOKEN}"
+          "headers": {
+            "Content-Type": "application/json",
+            "Authorization": "${CRAVE_TOKEN}",
+            "User-Agent": "Crave"
+          },
+          "projects": [],
+          "server": "https://foss.crave.io/api"
         }
         EOF
       env:
@@ -89,6 +95,7 @@ jobs:
         CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
 
     - name: Check and start self-hosted runner in crave devspace
+      continue-on-error: true
       run: |
         RUNNER_TOKEN="${{ github.event.inputs.RUNNER_TOKEN }}"
         REPO="${{ github.repository }}"
