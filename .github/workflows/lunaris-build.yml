@@ -1,29 +1,31 @@
 #
-# LunarisOS Build Workflow — uses GitHub Secrets for all credentials
+# ═══════════════════════════════════════════════════════════════════════
+#  LunarisOS Unified Build System
+# ═══════════════════════════════════════════════════════════════════════
 #
-# REQUIRED SECRETS (add in Settings → Secrets and variables → Actions):
-#   CRAVE_USERNAME      — your crave.io username
-#   CRAVE_TOKEN         — your crave.io API token
-#   TELEGRAM_BOT_TOKEN  — your Telegram bot token
-#   TELEGRAM_CHAT_ID    — your Telegram chat/user ID
-#   ZDRIVE_API_KEY      — your zdrive (zincdrive.com) API key
+#  This is the ONLY workflow you need. It handles:
+#    1. Runner setup   — installs the runner if missing, auto-restarts if dead
+#    2. Clone mgmt     — finds existing crave clone, creates one only if needed
+#    3. Build          — runs volt-secure.sh via crave run with auto-retry
+#    4. Notifications  — Telegram status throughout
 #
-# OPTIONAL SECRETS:
-#   CRAVE_FLAGS         — extra crave CLI flags
-#   CUSTOM_YAML         — custom crave.yaml content
-#   PAID                — set to anything to use aosp-silver (paid builds)
+#  SECURITY: Only triggers on workflow_dispatch. PRs CANNOT run this.
 #
-# SECURITY: This workflow ONLY triggers on workflow_dispatch (manual run).
-# Pull requests CANNOT trigger it. Only users with write access can run it.
+#  REQUIRED SECRETS:
+#    CRAVE_USERNAME, CRAVE_TOKEN, TELEGRAM_BOT_TOKEN,
+#    TELEGRAM_CHAT_ID, ZDRIVE_API_KEY
+#
+#  OPTIONAL SECRETS:
+#    CRAVE_FLAGS, CUSTOM_YAML, PAID
 #
 
-name: LunarisOS Build (Crave)
+name: Lunaris Build System
 
 on:
   workflow_dispatch:
     inputs:
       BUILD_MODULE:
-        description: 'Build module (e.g. "bacon", "bootimage", "KeyHandler")'
+        description: 'Build module (e.g. "bacon", "bootimage")'
         required: true
         default: 'bacon'
         type: string
@@ -41,37 +43,40 @@ on:
         type: boolean
 
       TREE_OVERRIDES:
-        description: 'Branch overrides for device trees (comma-separated). Example: kernel:test,device:main,vendor:test. Valid names: kernel, device, common, hardware, vendor, vendor-common, camera, dolby, pixelworks. Leave empty for defaults.'
+        description: 'Branch overrides (comma-separated). Ex: kernel:test,device:main,vendor:test. Valid: kernel, device, common, hardware, vendor, vendor-common, camera, dolby, pixelworks'
         required: false
         default: ''
         type: string
 
       MANIFEST_BRANCH:
-        description: 'Manifest branch override (default: 16.2)'
+        description: 'Manifest branch (default: 16.2)'
         required: false
         default: '16.2'
         type: string
 
       MAX_RETRIES:
-        description: 'Max retries if crave run fails instantly (Total time: 0s)'
+        description: 'Max retries on instant crave failure (Total time: 0s)'
         required: true
         default: '5'
         type: string
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 1: Start the self-hosted runner inside crave devspace
-  # ─────────────────────────────────────────────────────────────────────────────
-  start-runner:
+  # ═══════════════════════════════════════════════════════════════════════
+  # JOB 1: RUNNER MANAGEMENT
+  # Runs on GitHub cloud. Connects to crave devspace via SSH.
+  # Installs the runner if missing, restarts it if dead.
+  # ═══════════════════════════════════════════════════════════════════════
+  runner-setup:
+    name: "🔧 Runner Management"
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Set up environment
-      run: sudo apt-get update && sudo apt-get install -y tmux
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y tmux jq
 
-    - name: Configure crave
+    - name: Configure crave CLI
       run: |
         mkdir -p ${HOME}/bin/
         curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
@@ -83,148 +88,195 @@ jobs:
         CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
         CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
 
-    - name: Start runner in devspace
+    # ── Get a fresh runner registration token via GitHub API ──
+    - name: Get runner registration token
+      id: reg-token
       run: |
-        crave ${{ secrets.CRAVE_FLAGS }} devspace -- "echo 'Looking for runner...'
-          if [ -f actions-runner/run.sh ]; then
-            echo 'Runner found!'
+        TOKEN=$(curl -s -X POST \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
+          | jq -r '.token')
+
+        if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+          echo "::warning::Could not get registration token. Runner install/re-register won't work if runner is missing."
+          echo "GOT_TOKEN=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "GOT_TOKEN=true" >> "$GITHUB_OUTPUT"
+          # Mask the token so it doesn't leak in logs
+          echo "::add-mask::$TOKEN"
+          echo "REG_TOKEN=$TOKEN" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ── Connect to devspace and ensure runner is installed + running ──
+    - name: Ensure runner is installed and running
+      run: |
+        GOT_TOKEN="${{ steps.reg-token.outputs.GOT_TOKEN }}"
+        REG_TOKEN="${{ steps.reg-token.outputs.REG_TOKEN }}"
+        REPO="${{ github.repository }}"
+
+        crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
+          echo '══════════════════════════════════════════════'
+          echo '  RUNNER MANAGEMENT'
+          echo '══════════════════════════════════════════════'
+
+          # ── STEP 1: Check if runner is installed ──
+          if [ -f ~/actions-runner/run.sh ]; then
+            echo '✅ Runner binary found at ~/actions-runner/'
           else
-            echo 'Error! Runner not found!'
-            exit 1
+            echo '⚠️ Runner not found. Installing...'
+
+            # Get latest runner version
+            RUNNER_VERSION=\$(curl -s 'https://api.github.com/repos/actions/runner/releases/latest' | grep -oP '\"tag_name\": \"v\K[^\"]*')
+            if [ -z \"\$RUNNER_VERSION\" ]; then
+              echo '❌ Failed to get runner version'
+              exit 1
+            fi
+            echo \"  Downloading runner v\$RUNNER_VERSION...\"
+
+            mkdir -p ~/actions-runner && cd ~/actions-runner
+            curl -sL -o runner.tar.gz \"https://github.com/actions/runner/releases/download/v\${RUNNER_VERSION}/actions-runner-linux-x64-\${RUNNER_VERSION}.tar.gz\"
+            tar xzf runner.tar.gz
+            rm -f runner.tar.gz
+
+            # Configure the runner (unattended)
+            if [ '${GOT_TOKEN}' = 'true' ]; then
+              echo '  Configuring runner...'
+              ./config.sh --unattended --url \"https://github.com/${REPO}\" --token \"${REG_TOKEN}\" --name crave-devspace --labels self-hosted,Linux,X64 --replace
+              echo '✅ Runner installed and configured'
+            else
+              echo '❌ Cannot configure runner — no registration token available'
+              echo '   Run this manually in devspace:'
+              echo '   cd ~/actions-runner && ./config.sh --url https://github.com/${REPO} --token <TOKEN>'
+              exit 1
+            fi
+
+            cd ~
           fi
 
+          # ── STEP 2: Check if runner is running, start/restart if needed ──
           if tmux has-session -t ghactions 2>/dev/null; then
-            echo 'Runner is already running'
+            # Check if the runner process is actually alive inside tmux
+            RUNNER_PID=\$(pgrep -f 'Runner.Listener' || true)
+            if [ -n \"\$RUNNER_PID\" ]; then
+              echo '✅ Runner is running (PID: '\$RUNNER_PID')'
+            else
+              echo '⚠️ tmux session exists but runner process is dead. Restarting...'
+              tmux kill-session -t ghactions 2>/dev/null || true
+              tmux new-session -d -s ghactions
+              tmux send-keys -t ghactions 'cd ~/actions-runner && ./run.sh' Enter
+              sleep 3
+              echo '✅ Runner restarted'
+            fi
           else
+            echo '⚠️ No runner session found. Starting runner...'
             tmux kill-session -t ghactions 2>/dev/null || true
             tmux new-session -d -s ghactions
-            tmux send-keys -t ghactions './actions-runner/run.sh' Enter
-            echo 'Runner started'
-          fi"
+            tmux send-keys -t ghactions 'cd ~/actions-runner && ./run.sh' Enter
+            sleep 3
+            echo '✅ Runner started in tmux session ghactions'
+          fi
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 2: Validate inputs
-  # ─────────────────────────────────────────────────────────────────────────────
+          echo ''
+          echo '══════════════════════════════════════════════'
+          echo '  RUNNER READY'
+          echo '══════════════════════════════════════════════'
+        "
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # JOB 2: INPUT VALIDATION
+  # Quick checks before the build starts.
+  # ═══════════════════════════════════════════════════════════════════════
   validate:
-    name: Validate Inputs
+    name: "✅ Validate Inputs"
     runs-on: ubuntu-latest
     steps:
-    - name: Check Credentials
+    - name: Check secrets
       run: |
         MISSING=""
-        if [[ -z "${{ secrets.CRAVE_TOKEN }}" || -z "${{ secrets.CRAVE_USERNAME }}" ]]; then
-          MISSING="${MISSING}  - CRAVE_TOKEN / CRAVE_USERNAME\n"
-        fi
-        if [[ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" || -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]]; then
-          MISSING="${MISSING}  - TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID\n"
-        fi
-        if [[ -z "${{ secrets.ZDRIVE_API_KEY }}" ]]; then
-          MISSING="${MISSING}  - ZDRIVE_API_KEY\n"
-        fi
+        [[ -z "${{ secrets.CRAVE_TOKEN }}" || -z "${{ secrets.CRAVE_USERNAME }}" ]] && MISSING="${MISSING}  - CRAVE_TOKEN/USERNAME\n"
+        [[ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" || -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]] && MISSING="${MISSING}  - TELEGRAM_BOT_TOKEN/CHAT_ID\n"
+        [[ -z "${{ secrets.ZDRIVE_API_KEY }}" ]] && MISSING="${MISSING}  - ZDRIVE_API_KEY\n"
         if [[ -n "$MISSING" ]]; then
-          echo "::error::Missing required secrets:"
-          echo -e "$MISSING"
-          exit 1
+          echo "::error::Missing secrets:"; echo -e "$MISSING"; exit 1
         fi
-        echo "✅ All required secrets are configured"
+        echo "✅ All secrets configured"
 
-    - name: Validate tree overrides format
+    - name: Validate tree overrides
       run: |
         OVERRIDES="${{ github.event.inputs.TREE_OVERRIDES }}"
-        VALID_TREES="kernel device common hardware vendor vendor-common camera dolby pixelworks"
-
-        if [[ -z "$OVERRIDES" ]]; then
-          echo "✅ No tree overrides — using all defaults"
-          exit 0
-        fi
+        VALID="kernel device common hardware vendor vendor-common camera dolby pixelworks"
+        [[ -z "$OVERRIDES" ]] && { echo "✅ No overrides — using defaults"; exit 0; }
 
         IFS=',' read -ra ENTRIES <<< "$OVERRIDES"
         for entry in "${ENTRIES[@]}"; do
-          entry=$(echo "$entry" | xargs)  # trim whitespace
+          entry=$(echo "$entry" | xargs)
           [[ -z "$entry" ]] && continue
-
-          if [[ "$entry" != *":"* ]]; then
-            echo "::error::Tree override '$entry' must be in format name:branch (e.g. kernel:test)"
-            exit 1
-          fi
-
-          name="${entry%%:*}"
-          name="${name,,}"
-          branch="${entry#*:}"
-
-          if [[ -z "$branch" ]]; then
-            echo "::error::Tree override '$entry' has empty branch"
-            exit 1
-          fi
-
-          if ! echo "$VALID_TREES" | grep -qw "$name"; then
-            echo "::error::Unknown tree '$name'. Valid: $VALID_TREES"
-            exit 1
-          fi
-
-          echo "✅ Override: $name → $branch"
+          [[ "$entry" != *":"* ]] && { echo "::error::'$entry' must be name:branch"; exit 1; }
+          name="${entry%%:*}"; name="${name,,}"; branch="${entry#*:}"
+          [[ -z "$branch" ]] && { echo "::error::'$entry' has empty branch"; exit 1; }
+          echo "$VALID" | grep -qw "$name" || { echo "::error::Unknown tree '$name'. Valid: $VALID"; exit 1; }
+          echo "✅ $name → $branch"
         done
 
-    - name: Display Build Configuration
+    - name: Show config
       run: |
-        echo "::group::Build Configuration"
-        echo "Build Module:     ${{ github.event.inputs.BUILD_MODULE }}"
-        echo "Skip Sync:        ${{ github.event.inputs.SKIP_SYNC }}"
-        echo "Run Reset:        ${{ github.event.inputs.RUN_RESET }}"
-        echo "Tree Overrides:   ${{ github.event.inputs.TREE_OVERRIDES || 'none (all defaults)' }}"
-        echo "Manifest Branch:  ${{ github.event.inputs.MANIFEST_BRANCH }}"
-        echo "Max Retries:      ${{ github.event.inputs.MAX_RETRIES }}"
-        echo "::endgroup::"
+        echo "Module:         ${{ github.event.inputs.BUILD_MODULE }}"
+        echo "Skip Sync:      ${{ github.event.inputs.SKIP_SYNC }}"
+        echo "Reset:          ${{ github.event.inputs.RUN_RESET }}"
+        echo "Tree Overrides: ${{ github.event.inputs.TREE_OVERRIDES || 'defaults' }}"
+        echo "Manifest:       ${{ github.event.inputs.MANIFEST_BRANCH }}"
+        echo "Max Retries:    ${{ github.event.inputs.MAX_RETRIES }}"
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 3: Build on crave devspace (self-hosted runner)
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════════════
+  # JOB 3: BUILD
+  # Runs on the self-hosted runner inside crave devspace.
+  # Finds/creates clone → crave run → auto-retry on instant failures.
+  # ═══════════════════════════════════════════════════════════════════════
   build:
+    name: "🔨 Build LunarisOS"
     timeout-minutes: 720
-    name: Build LunarisOS on Crave
-    needs: [start-runner, validate]
+    needs: [runner-setup, validate]
     runs-on: self-hosted
     concurrency:
       group: ${{ github.repository_owner }}
 
     steps:
-    # ─── FIND OR CREATE THE PROJECT CLONE ─────────────────────────────
-    # Uses existing clone. Only creates if none exists. NEVER destroys.
-    # ──────────────────────────────────────────────────────────────────
+    # ── Find or create the project clone (NEVER destroys) ──
     - name: Find or create project clone
       run: |
         echo "Checking for existing crave clones..."
-        CLONE_PATH=$(crave clone list --json | jq -r '.clones[0]."Cloned At" // empty')
+        CLONE_JSON=$(crave clone list --json 2>/dev/null || echo '{"clones":[]}')
+        CLONE_PATH=$(echo "$CLONE_JSON" | jq -r '.clones[0]."Cloned At" // empty')
 
         if [[ -n "$CLONE_PATH" && -d "$CLONE_PATH" ]]; then
-          echo "✅ Found existing clone at: $CLONE_PATH"
+          echo "✅ Found existing clone: $CLONE_PATH"
         else
-          echo "⚠️ No existing clone found. Creating one..."
+          echo "⚠️ No clone found. Creating one..."
           CLONE_PATH="/crave-devspaces/Lineage22.1"
           crave clone create --projectID 93 "$CLONE_PATH"
-          echo "✅ Created new clone at: $CLONE_PATH"
+          echo "✅ Created clone: $CLONE_PATH"
         fi
 
         echo "PROJECTFOLDER=$CLONE_PATH" >> "$GITHUB_ENV"
-        echo "Using project folder: $CLONE_PATH"
 
-    - name: Telegram — Build Queued
+    - name: Telegram — Build Started
       continue-on-error: true
       run: |
-        OVERRIDES_DISPLAY="${{ github.event.inputs.TREE_OVERRIDES || 'all defaults' }}"
+        MSG="🚀 *Lunaris Build Started*
+
+        📦 Module: ${{ github.event.inputs.BUILD_MODULE }}
+        🔄 Sync: ${{ github.event.inputs.SKIP_SYNC == 'true' && 'SKIP' || 'YES' }}
+        🌿 Overrides: ${{ github.event.inputs.TREE_OVERRIDES || 'defaults' }}
+        📁 Clone: ${PROJECTFOLDER}
+        🔁 Max Retries: ${{ github.event.inputs.MAX_RETRIES }}
+
+        [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
         curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          --data-urlencode "text=🚀 *LunarisOS Build Queued*
-
-Module: ${{ github.event.inputs.BUILD_MODULE }}
-Skip Sync: ${{ github.event.inputs.SKIP_SYNC }}
-Tree Overrides: ${OVERRIDES_DISPLAY}
-Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
-Max Retries: ${{ github.event.inputs.MAX_RETRIES }}
-Project: ${PROJECTFOLDER}
-
-[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+          --data-urlencode "text=${MSG}" \
           -d "parse_mode=Markdown" \
           -d "disable_web_page_preview=true"
       env:
@@ -236,8 +288,8 @@ Project: ${PROJECTFOLDER}
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
-    # ─── THE MAIN BUILD WITH AUTO-RETRY ─────────────────────────────────
-    - name: Build LunarisOS via volt-secure.sh (with auto-retry)
+    # ── THE BUILD — with auto-retry for instant crave failures ──
+    - name: Run build (auto-retry on crave glitches)
       run: |
         cd "$PROJECTFOLDER"
 
@@ -251,9 +303,9 @@ Project: ${PROJECTFOLDER}
 
         for attempt in $(seq 1 "$MAX_RETRIES"); do
           echo ""
-          echo "========================================================================"
+          echo "════════════════════════════════════════════════════"
           echo "  ATTEMPT ${attempt}/${MAX_RETRIES}"
-          echo "========================================================================"
+          echo "════════════════════════════════════════════════════"
           echo ""
 
           OUTFILE=$(mktemp)
@@ -274,16 +326,18 @@ Project: ${PROJECTFOLDER}
           TAIL_OUTPUT=$(tail -20 "$OUTFILE")
           rm -f "$OUTFILE"
 
+          # ── SUCCESS ──
           if [[ $EXIT_CODE -eq 0 ]]; then
             echo ""
-            echo "✅ Build completed successfully on attempt ${attempt}!"
+            echo "✅ Build succeeded on attempt ${attempt}!"
             exit 0
           fi
 
-          # Check for instant crave failure (Total time: 0s)
-          if echo "$TAIL_OUTPUT" | grep -q "Total time: 0s" && echo "$TAIL_OUTPUT" | grep -q "Build Failed"; then
+          # ── INSTANT CRAVE FAILURE (Total time: 0s) → RETRY ──
+          if echo "$TAIL_OUTPUT" | grep -q "Total time: 0s" && \
+             echo "$TAIL_OUTPUT" | grep -q "Build Failed"; then
             echo ""
-            echo "⚠️  Instant crave failure detected (Total time: 0s) — attempt ${attempt}/${MAX_RETRIES}"
+            echo "⚠️ Instant crave failure (Total time: 0s) — attempt ${attempt}/${MAX_RETRIES}"
 
             if [[ $attempt -lt $MAX_RETRIES ]]; then
               echo "   Retrying in ${RETRY_DELAY}s..."
@@ -291,28 +345,28 @@ Project: ${PROJECTFOLDER}
               curl -s -X POST \
                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                -d "text=🔄 *Crave instant failure* (Total time: 0s)%0AAttempt ${attempt}/${MAX_RETRIES} failed%0ARetrying in ${RETRY_DELAY}s..." \
+                -d "text=🔄 Crave glitch (Total time: 0s)%0AAttempt ${attempt}/${MAX_RETRIES}%0ARetrying in ${RETRY_DELAY}s..." \
                 -d "parse_mode=Markdown" > /dev/null 2>&1 || true
 
               sleep "$RETRY_DELAY"
               continue
             else
-              echo "   ❌ All ${MAX_RETRIES} attempts exhausted."
+              echo "   ❌ All ${MAX_RETRIES} attempts exhausted"
 
               curl -s -X POST \
                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                -d "text=❌ *Crave keeps failing instantly*%0AAll ${MAX_RETRIES} attempts exhausted." \
+                -d "text=❌ All ${MAX_RETRIES} crave attempts failed (Total time: 0s each)" \
                 -d "parse_mode=Markdown" > /dev/null 2>&1 || true
 
               exit 1
             fi
-          else
-            # Real build failure — don't retry
-            echo ""
-            echo "❌ Real build failure on attempt ${attempt} (exit: ${EXIT_CODE})"
-            exit $EXIT_CODE
           fi
+
+          # ── REAL BUILD FAILURE → DON'T RETRY ──
+          echo ""
+          echo "❌ Real build failure (exit: ${EXIT_CODE}) — not retrying"
+          exit $EXIT_CODE
         done
       timeout-minutes: 720
       env:
@@ -325,43 +379,36 @@ Project: ${PROJECTFOLDER}
         INPUT_TREE_OVERRIDES: ${{ github.event.inputs.TREE_OVERRIDES }}
         INPUT_MANIFEST_BRANCH: ${{ github.event.inputs.MANIFEST_BRANCH }}
 
-    # ─── POST-BUILD ─────────────────────────────────────────────────────
-
-    - name: Telegram — Build Succeeded
+    # ── Post-build Telegram notifications ──
+    - name: Telegram — Success
       if: ${{ success() }}
       continue-on-error: true
       run: |
         curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=✅ *LunarisOS Build Succeeded!*%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+          -d "text=✅ *Lunaris Build Succeeded!*%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A[View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
           -d "parse_mode=Markdown" \
           -d "disable_web_page_preview=true"
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-    - name: Telegram — Build Failed
+    - name: Telegram — Failed/Cancelled
       if: ${{ failure() || cancelled() }}
       continue-on-error: true
       run: |
-        if [ "${{ job.status }}" = "cancelled" ]; then
-          STATUS="🛑 Cancelled"
-        else
-          STATUS="❌ Failed"
-        fi
+        [[ "${{ job.status }}" == "cancelled" ]] && S="🛑 Cancelled" || S="❌ Failed"
         curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=${STATUS} *LunarisOS Build*%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+          -d "text=${S} *Lunaris Build*%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A[View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
           -d "parse_mode=Markdown" \
           -d "disable_web_page_preview=true"
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-    - name: Cancel crave jobs on workflow cancel
+    - name: Stop crave on cancel
       if: ${{ cancelled() }}
-      run: |
-        cd "$PROJECTFOLDER"
-        crave stop --all
+      run: cd "$PROJECTFOLDER" && crave stop --all
