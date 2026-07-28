@@ -436,13 +436,13 @@ smart_clone() {
     update_tg_status "Cloning Trees 🌲" "⏳ Fetching ${comp_name} (branch: ${branch})..."
 
     if [ -d "$target_dir" ]; then
-        retry "$CLONE_MAX_ATTEMPTS" "$CLONE_RETRY_DELAY" git -C "$target_dir" fetch "$repo_url" "$branch" \
+        retry "$CLONE_MAX_ATTEMPTS" "$CLONE_RETRY_DELAY" git -C "$target_dir" fetch --depth=1 "$repo_url" "$branch" \
             || die "Failed fetching ${comp_name} (branch '${branch}' on ${repo_url})"
         git -C "$target_dir" reset --hard FETCH_HEAD \
             || die "Failed resetting ${comp_name} to FETCH_HEAD"
         git -C "$target_dir" clean -fdx
     else
-        retry "$CLONE_MAX_ATTEMPTS" "$CLONE_RETRY_DELAY" git clone "$repo_url" -b "$branch" "$target_dir" \
+        retry "$CLONE_MAX_ATTEMPTS" "$CLONE_RETRY_DELAY" git clone --depth=1 "$repo_url" -b "$branch" "$target_dir" \
             || die "Failed cloning ${comp_name} (branch '${branch}' on ${repo_url})"
     fi
 }
