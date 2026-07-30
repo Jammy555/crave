@@ -80,32 +80,68 @@ jobs:
         REPO="${{ github.repository }}"
 
         status=0
-        timeout 35s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
-          if [ -d \$HOME/actions-runner ] && [ -f \$HOME/actions-runner/run.sh ]; then
+        timeout 60s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
+          set -e
+
+          RUNNER_DIR=\$HOME/actions-runner
+          RUNNER_LOG=/tmp/runner.log
+          RUNNER_PID_FILE=/tmp/runner.pid
+
+          runner_is_alive() {
+            if [ -f \"\$RUNNER_PID_FILE\" ]; then
+              local pid
+              pid=\$(cat \"\$RUNNER_PID_FILE\")
+              kill -0 \"\$pid\" 2>/dev/null && return 0
+            fi
+            pgrep -f 'Runner.Listener' >/dev/null 2>&1 && return 0
+            return 1
+          }
+
+          start_runner() {
+            # Kill any stale runner processes
+            pkill -f 'Runner.Listener' 2>/dev/null || true
+            pkill -f 'run.sh' 2>/dev/null || true
+            sleep 1
+
+            cd \"\$RUNNER_DIR\"
+            nohup bash run.sh > \"\$RUNNER_LOG\" 2>&1 &
+            local pid=\$!
+            disown \$pid
+            echo \$pid > \"\$RUNNER_PID_FILE\"
+            echo \"Runner started with PID \$pid\"
+
+            # Wait up to 25s for Runner.Listener to appear
+            for i in \$(seq 1 25); do
+              sleep 1
+              if pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
+                echo \"Runner.Listener confirmed listening after \${i}s\"
+                return 0
+              fi
+            done
+            echo 'WARNING: Runner.Listener not seen after 25s — check /tmp/runner.log'
+            tail -20 \"\$RUNNER_LOG\" 2>/dev/null || true
+          }
+
+          if [ -d \"\$RUNNER_DIR\" ] && [ -f \"\$RUNNER_DIR/run.sh\" ]; then
             echo 'Runner binary found'
-            if tmux has-session -t ghactions 2>/dev/null && pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
-              echo 'Self-hosted runner is active'
+            if runner_is_alive; then
+              echo 'Runner is already running and listening'
             else
-              echo 'Runner session dead. Restarting...'
-              tmux kill-session -t ghactions 2>/dev/null || true
-              tmux new-session -d -s ghactions
-              tmux send-keys -t ghactions 'cd \$HOME/actions-runner && ./run.sh' Enter
-              sleep 2
-              echo 'Runner restarted'
+              echo 'Runner not running. Starting with nohup...'
+              start_runner
             fi
           elif [ -n \"$RUNNER_TOKEN\" ]; then
-            echo 'Setting up new self-hosted runner...'
-            mkdir -p \$HOME/actions-runner && cd \$HOME/actions-runner
+            echo 'First-time setup: installing runner...'
+            mkdir -p \"\$RUNNER_DIR\" && cd \"\$RUNNER_DIR\"
             RUNNER_VER=\$(curl -s 'https://api.github.com/repos/actions/runner/releases/latest' | grep -oP '\"tag_name\": \"v\K[^\"]*')
+            echo \"Downloading runner v\${RUNNER_VER}...\"
             curl -sL -o runner.tar.gz \"https://github.com/actions/runner/releases/download/v\${RUNNER_VER}/actions-runner-linux-x64-\${RUNNER_VER}.tar.gz\"
             tar xzf runner.tar.gz && rm -f runner.tar.gz
             ./config.sh --unattended --url \"https://github.com/${REPO}\" --token \"$RUNNER_TOKEN\" --name crave-devspace --labels self-hosted,Linux,X64 --replace
-            tmux kill-session -t ghactions 2>/dev/null || true
-            tmux new-session -d -s ghactions
-            tmux send-keys -t ghactions './run.sh' Enter
-            echo 'New runner installed and started'
+            echo 'Runner configured. Starting with nohup...'
+            start_runner
           else
-            echo 'Runner not installed and no RUNNER_TOKEN provided.'
+            echo 'ERROR: Runner not installed and no RUNNER_TOKEN provided.'
             exit 1
           fi
         " || status=$?
