@@ -293,10 +293,17 @@ jobs:
           MONITOR_PID=$!
           echo "Monitor started (PID: $MONITOR_PID)"
 
+          # Build volt command string — include -s -- ONLY if arguments are passed
+          if [[ -n "${BUILD_COMMAND}" ]]; then
+            VOLT_CMD="curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash -s -- ${BUILD_COMMAND}"
+          else
+            VOLT_CMD="curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash"
+          fi
+
           # Run the build — NO SECRETS in this command
           set +e
           crave ${{ secrets.CRAVE_FLAGS }} run --no-patch ${PAID_FLAG} -- \
-            "curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash -s -- ${BUILD_COMMAND}" \
+            "$VOLT_CMD" \
             2>&1 | tee "$LOG_FILE"
           EXIT_CODE=${PIPESTATUS[0]}
           set -e
