@@ -46,7 +46,7 @@ ANDROID_VERSION="16"
 MANIFEST_URL="https://github.com/Lunaris-AOSP/android.git"
 MANIFEST_BRANCH="16.2"
 
-# --- Sync history marker -----------------------------------------------
+# --- Sync history markers -----------------------------------------------
 SYNC_HISTORY_FILE=".repo/.volt_sync_history"
 
 # --- Tree lookup: "repo_url|local_path|display_name|default_branch" --------
@@ -71,6 +71,7 @@ INTERRUPT_GRACE_SECONDS=5
 REPO_INIT_TIMEOUT_SECONDS=600
 RESYNC_TIMEOUT_SECONDS=14400
 MAX_MODULES=2
+STATS_EMIT_INTERVAL=30   # emit [VOLT_STATS] to stdout every 30s during build
 
 # --- Shell environment -------------------------------------------------------
 export TZ="Asia/Kolkata"
@@ -82,6 +83,7 @@ export BUILD_HOSTNAME="crave"
 # =============================================================================
 START_TIME=$(date +%s)
 STEP_START_TIME=$START_TIME
+LAST_STATS_TIME=0          # tracks when we last emitted [VOLT_STATS]
 CURRENT_STAGE="Initializing"
 FAILURE_REASON=""
 MODULE_FAILURE_COUNT=0
@@ -382,6 +384,73 @@ clean_stale_locks() {
 }
 
 # =============================================================================
+# STATS EMITTER — reads from BUILD CONTAINER's /proc (not devspace)
+# Emits [VOLT_STATS] tag to stdout; monitor.sh parses it.
+# Format: [VOLT_STATS] cpu=<pct>|ram_used=<h>|ram_total=<h>|ram_pct=<pct>|disk_used=<h>|disk_total=<h>|disk_pct=<pct>|load=<load1>|cores=<n>
+# =============================================================================
+emit_stats() {
+    local now
+    now=$(date +%s)
+    if (( now - LAST_STATS_TIME < STATS_EMIT_INTERVAL )); then
+        return
+    fi
+    LAST_STATS_TIME=$now
+
+    # CPU: sample /proc/stat over 0.5s — works unprivileged on any Linux
+    local cpu_pct=0
+    if command -v python3 &>/dev/null; then
+        cpu_pct=$(python3 -c "
+import time
+def snap():
+    with open('/proc/stat') as f:
+        v=[float(x) for x in f.readline().split()[1:]]
+    return sum(v), v[3]+v[4]
+t1,i1=snap(); time.sleep(0.5); t2,i2=snap()
+dt,di=t2-t1,i2-i1
+print(max(0,min(100,int(((dt-di)/dt)*100))) if dt>0 else 0)" 2>/dev/null || echo "0")
+    fi
+
+    # Load average + core count (unprivileged)
+    local load1 cores
+    load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0")
+    cores=$(nproc 2>/dev/null || echo "1")
+
+    # RAM: /proc/meminfo (unprivileged)
+    local ram_total_kb ram_avail_kb ram_used_kb ram_total_mb ram_used_mb ram_pct
+    ram_total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo "1")
+    ram_avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || echo "0")
+    ram_used_kb=$(( ram_total_kb - ram_avail_kb ))
+    ram_total_mb=$(( ram_total_kb / 1024 ))
+    ram_used_mb=$(( ram_used_kb / 1024 ))
+    ram_pct=$(( ram_used_kb * 100 / ram_total_kb ))
+    # Format as human-readable GB/MB
+    local ram_used_h ram_total_h
+    if (( ram_used_mb >= 1024 )); then
+        ram_used_h="$(( ram_used_mb / 1024 )).$((( ram_used_mb % 1024 ) * 10 / 1024))G"
+    else
+        ram_used_h="${ram_used_mb}M"
+    fi
+    if (( ram_total_mb >= 1024 )); then
+        ram_total_h="$(( ram_total_mb / 1024 )).$((( ram_total_mb % 1024 ) * 10 / 1024))G"
+    else
+        ram_total_h="${ram_total_mb}M"
+    fi
+
+    # Disk: df on current working dir (the AOSP source tree — no sudo needed)
+    local disk_used_kb disk_total_kb disk_pct disk_used_h disk_total_h
+    disk_total_kb=$(df -k . 2>/dev/null | awk 'NR==2{print $2}' || echo "1")
+    disk_used_kb=$(df -k . 2>/dev/null | awk 'NR==2{print $3}' || echo "0")
+    disk_pct=$(( disk_used_kb * 100 / disk_total_kb ))
+    local disk_used_gb disk_total_gb
+    disk_used_gb=$(( disk_used_kb / 1048576 ))
+    disk_total_gb=$(( disk_total_kb / 1048576 ))
+    disk_used_h="${disk_used_gb}G"
+    disk_total_h="${disk_total_gb}G"
+
+    echo "[VOLT_STATS] cpu=${cpu_pct}|ram_used=${ram_used_h}|ram_total=${ram_total_h}|ram_pct=${ram_pct}|disk_used=${disk_used_h}|disk_total=${disk_total_h}|disk_pct=${disk_pct}|load=${load1}|cores=${cores}"
+}
+
+# =============================================================================
 # BUILD FUNCTION
 # =============================================================================
 start_build_process() {
@@ -519,10 +588,14 @@ start_build_process() {
         local last_log_size=0
         local last_activity_time=$(date +%s)
         local STALL_TIMEOUT_SECONDS=1200   # 20 minutes of zero output AND idle CPU = stalled
+        LAST_STATS_TIME=0  # reset per module so first stat fires quickly
 
         while kill -0 "$BUILD_PID" 2>/dev/null; do
             sleep "$POLL_INTERVAL_SECONDS"
             loop_count=$((loop_count + 1))
+
+            # Emit stats every STATS_EMIT_INTERVAL seconds
+            emit_stats
 
             # --- BUILD STALL WATCHDOG ---
             local current_log_size=0

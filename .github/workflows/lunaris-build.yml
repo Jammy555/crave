@@ -278,7 +278,8 @@ jobs:
           kill "$MONITOR_PID" 2>/dev/null || true
           wait "$MONITOR_PID" 2>/dev/null || true
 
-          TAIL_OUTPUT=$(tail -20 "$LOG_FILE")
+          FULL_OUTPUT_LINES=$(wc -l < "$LOG_FILE" 2>/dev/null || echo "0")
+          TAIL_OUTPUT=$(tail -30 "$LOG_FILE" 2>/dev/null || true)
 
           # ── SUCCESS ──
           if [[ $EXIT_CODE -eq 0 ]]; then
@@ -348,11 +349,31 @@ Check GitHub Actions logs for details." \
             exit 0
           fi
 
-          # ── INSTANT CRAVE FAILURE (Total time: 0s) → RETRY ──
-          if echo "$TAIL_OUTPUT" | grep -q "Total time: 0s" && \
-             echo "$TAIL_OUTPUT" | grep -q "Build Failed"; then
+          # ── DECIDE: CRAVE GLITCH (retry) vs REAL FAILURE (no retry) ──
+          #
+          # RETRY only when the output contains the exact crave glitch signature:
+          #   "Build Failed" + "Total time: 0s"  → crave never dispatched a worker
+          # OR when the log is completely empty → crave didn't connect at all.
+          #
+          # Everything else = real build failure. Send the log, exit.
+
+          IS_CRAVE_GLITCH=0
+
+          # Case 1: classic instant failure signature
+          if echo "$TAIL_OUTPUT" | grep -qF "Total time: 0s" && \
+             echo "$TAIL_OUTPUT" | grep -qF "Build Failed"; then
+            IS_CRAVE_GLITCH=1
+          fi
+
+          # Case 2: empty output (crave returned nothing at all)
+          if [[ "$FULL_OUTPUT_LINES" -eq 0 || -z "$TAIL_OUTPUT" ]]; then
+            IS_CRAVE_GLITCH=1
+          fi
+
+          if [[ $IS_CRAVE_GLITCH -eq 1 ]]; then
             echo ""
-            echo "⚠️ Instant crave failure (Total time: 0s) — attempt ${attempt}/${MAX_RETRIES}"
+            echo "⚠️ Crave glitch detected (no real build started) — attempt ${attempt}/${MAX_RETRIES}"
+            echo "   Output lines: ${FULL_OUTPUT_LINES}, exit: ${EXIT_CODE}"
 
             if [[ $attempt -lt $MAX_RETRIES ]]; then
               echo "   Retrying in ${RETRY_DELAY}s..."
@@ -360,30 +381,34 @@ Check GitHub Actions logs for details." \
               curl -s -X POST \
                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                -d "text=🔄 Crave glitch (Total time: 0s)%0AAttempt ${attempt}/${MAX_RETRIES}%0ARetrying in ${RETRY_DELAY}s..." \
-                -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+                --data-urlencode "text=🔄 <b>Crave glitch — build never started</b>
+Attempt ${attempt}/${MAX_RETRIES} — retrying in ${RETRY_DELAY}s...
+
+<code>${TAIL_OUTPUT:-(empty output)}</code>" \
+                -d "parse_mode=HTML" > /dev/null 2>&1 || true
 
               sleep "$RETRY_DELAY"
               continue
             else
-              echo "   ❌ All ${MAX_RETRIES} attempts exhausted"
+              echo "   ❌ All ${MAX_RETRIES} glitch retries exhausted"
 
               curl -s -X POST \
                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                -d "text=❌ All ${MAX_RETRIES} crave attempts failed (Total time: 0s each)" \
-                -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+                --data-urlencode "text=❌ <b>All ${MAX_RETRIES} crave attempts failed — never got a worker</b>
+
+<code>${TAIL_OUTPUT:-(empty output)}</code>" \
+                -d "parse_mode=HTML" > /dev/null 2>&1 || true
 
               exit 1
             fi
           fi
 
-          # ── REAL BUILD FAILURE → DON'T RETRY ──
+          # ── REAL BUILD FAILURE → never retry, always send log ──
           echo ""
           echo "❌ Real build failure (exit: ${EXIT_CODE}) — not retrying"
 
-          # Send last 50 lines of log to Telegram
-          LAST_LINES=$(tail -50 "$LOG_FILE" 2>/dev/null || echo "No log available")
+          LAST_LINES=$(tail -30 "$LOG_FILE" 2>/dev/null || echo "No log available")
           curl -s -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
@@ -392,8 +417,8 @@ Check GitHub Actions logs for details." \
 • <b>Exit Code:</b> ${EXIT_CODE}
 • <b>Command:</b> <code>${BUILD_COMMAND}</code>
 
-<b>Last lines:</b>
-<pre>$(echo "$LAST_LINES" | tail -20 | head -c 3000)</pre>" \
+<b>Last log lines:</b>
+<pre>$(echo "$LAST_LINES" | head -c 3000)</pre>" \
             -d "parse_mode=HTML" || true
 
           exit $EXIT_CODE
