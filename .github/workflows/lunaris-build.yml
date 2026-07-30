@@ -5,6 +5,12 @@
 #
 #  SECURITY: Only triggers on workflow_dispatch. PRs CANNOT run this.
 #
+#  ARCHITECTURE:
+#    - volt.sh runs inside the build cluster (NO secrets, pure build)
+#    - monitor.sh runs on the self-hosted runner (sends Telegram updates)
+#    - Secrets (bot token, zdrive key) NEVER leave the runner
+#    - After build: crave pull + zdrive upload from runner side
+#
 #  REQUIRED SECRETS:
 #    CRAVE_USERNAME, CRAVE_TOKEN, TELEGRAM_BOT_TOKEN,
 #    TELEGRAM_CHAT_ID, ZDRIVE_API_KEY
@@ -18,34 +24,10 @@ name: Lunaris Build System
 on:
   workflow_dispatch:
     inputs:
-      BUILD_MODULE:
-        description: 'Build module (e.g. "bacon", "bootimage")'
+      BUILD_COMMAND:
+        description: 'Build command args (e.g. "bacon", "--nosync --nosyncd bacon", "--reset --tree1=kernel:test bacon")'
         required: true
         default: 'bacon'
-        type: string
-
-      SKIP_SYNC:
-        description: 'Skip syncing sources (--nosync)?'
-        required: true
-        default: false
-        type: boolean
-
-      RUN_RESET:
-        description: 'Hard-reset repos before building (--reset)?'
-        required: true
-        default: false
-        type: boolean
-
-      TREE_OVERRIDES:
-        description: 'Branch overrides (comma-separated). Ex: kernel:test,device:main,vendor:test. Valid: kernel, device, common, device-common, hardware, vendor, vendor-common, camera, dolby, pixelworks'
-        required: false
-        default: ''
-        type: string
-
-      MANIFEST_BRANCH:
-        description: 'Manifest branch (default: 16.2)'
-        required: false
-        default: '16.2'
         type: string
 
       MAX_RETRIES:
@@ -141,7 +123,6 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════════════
   # JOB 2: INPUT VALIDATION
-  # Quick checks before the build starts.
   # ═══════════════════════════════════════════════════════════════════════
   validate:
     name: "✅ Validate Inputs"
@@ -158,36 +139,18 @@ jobs:
         fi
         echo "✅ All secrets configured"
 
-    - name: Validate tree overrides
-      run: |
-        OVERRIDES="${{ github.event.inputs.TREE_OVERRIDES }}"
-        VALID="kernel device common device-common hardware vendor vendor-common camera dolby pixelworks"
-        [[ -z "$OVERRIDES" ]] && { echo "✅ No overrides — using defaults"; exit 0; }
-
-        IFS=',' read -ra ENTRIES <<< "$OVERRIDES"
-        for entry in "${ENTRIES[@]}"; do
-          entry=$(echo "$entry" | xargs)
-          [[ -z "$entry" ]] && continue
-          [[ "$entry" != *":"* ]] && { echo "::error::'$entry' must be name:branch"; exit 1; }
-          name="${entry%%:*}"; name="${name,,}"; branch="${entry#*:}"
-          [[ -z "$branch" ]] && { echo "::error::'$entry' has empty branch"; exit 1; }
-          echo "$VALID" | grep -qw "$name" || { echo "::error::Unknown tree '$name'. Valid: $VALID"; exit 1; }
-          echo "✅ $name → $branch"
-        done
-
     - name: Show config
       run: |
-        echo "Module:         ${{ github.event.inputs.BUILD_MODULE }}"
-        echo "Skip Sync:      ${{ github.event.inputs.SKIP_SYNC }}"
-        echo "Reset:          ${{ github.event.inputs.RUN_RESET }}"
-        echo "Tree Overrides: ${{ github.event.inputs.TREE_OVERRIDES || 'defaults' }}"
-        echo "Manifest:       ${{ github.event.inputs.MANIFEST_BRANCH }}"
+        echo "Build Command:  ${{ github.event.inputs.BUILD_COMMAND }}"
         echo "Max Retries:    ${{ github.event.inputs.MAX_RETRIES }}"
 
   # ═══════════════════════════════════════════════════════════════════════
   # JOB 3: BUILD
   # Runs on the self-hosted runner inside crave devspace.
-  # Finds/creates clone → crave run → auto-retry on instant failures.
+  # Finds/creates clone → crave run → monitor → pull → upload.
+  #
+  # SECURITY: No secrets are passed into `crave run`. volt.sh is a
+  # pure build script. Telegram/zdrive happen on the runner side ONLY.
   # ═══════════════════════════════════════════════════════════════════════
   build:
     name: "🔨 Build LunarisOS"
@@ -227,9 +190,7 @@ jobs:
       run: |
         MSG="🚀 *Lunaris Build Started*
 
-        📦 Module: ${{ github.event.inputs.BUILD_MODULE }}
-        🔄 Sync: ${{ github.event.inputs.SKIP_SYNC == 'true' && 'SKIP' || 'YES' }}
-        🌿 Overrides: ${{ github.event.inputs.TREE_OVERRIDES || 'defaults' }}
+        📦 Command: \`${{ github.event.inputs.BUILD_COMMAND }}\`
         📁 Clone: ${PROJECTFOLDER}
         🔁 Max Retries: ${{ github.event.inputs.MAX_RETRIES }}
 
@@ -250,19 +211,31 @@ jobs:
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
+    # ── Install zdrive on the runner (devspace) ──
+    - name: Setup zdrive CLI
+      run: |
+        if ! command -v zdrive &> /dev/null; then
+          curl -s https://zincdrive.com/cli | bash
+          sleep 2
+        fi
+        export PATH="/home/admin/.local/bin:$HOME/.local/bin:$PATH"
+        echo "PATH=/home/admin/.local/bin:$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
+        zdrive setup "${ZDRIVE_API_KEY}"
+      env:
+        ZDRIVE_API_KEY: ${{ secrets.ZDRIVE_API_KEY }}
+
     # ── THE BUILD — with auto-retry for instant crave failures ──
+    #
+    # SECURITY: No secrets in the crave run command. volt.sh streams
+    # structured status to stdout. monitor.sh reads it and sends
+    # Telegram updates using secrets that stay on the runner.
     - name: Run build (auto-retry on crave glitches)
       run: |
         set +x
         cd "$PROJECTFOLDER"
 
-        # Write secrets to ~/.crave_env so crave CLI never logs raw tokens
-        cat <<EOF > $HOME/.crave_env
-        export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
-        export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
-        export ZDRIVE_API_KEY="${ZDRIVE_API_KEY}"
-        EOF
-        chmod 600 $HOME/.crave_env
+        BUILD_COMMAND="${INPUT_BUILD_COMMAND}"
+        LOG_FILE="/tmp/crave_build_output.log"
 
         PAID_FLAG=""
         if [[ -n "${{ secrets.PAID }}" ]]; then
@@ -276,29 +249,102 @@ jobs:
           echo ""
           echo "════════════════════════════════════════════════════"
           echo "  ATTEMPT ${attempt}/${MAX_RETRIES}"
+          echo "  Command: ${BUILD_COMMAND}"
           echo "════════════════════════════════════════════════════"
           echo ""
 
-          OUTFILE=$(mktemp)
+          # Clean previous log
+          rm -f "$LOG_FILE"
+          touch "$LOG_FILE"
+
+          # Download and start the background Telegram monitor
+          # It reads the log file and sends progress updates
+          MONITOR_SCRIPT="/tmp/volt_monitor_$$.sh"
+          curl -LSs "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/monitor.sh" -o "$MONITOR_SCRIPT"
+          chmod +x "$MONITOR_SCRIPT"
+          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$$" &
+          MONITOR_PID=$!
+          echo "Monitor started (PID: $MONITOR_PID)"
+
+          # Run the build — NO SECRETS in this command!
+          # volt.sh is a pure build script, all status goes to stdout.
           set +e
           crave ${{ secrets.CRAVE_FLAGS }} run --no-patch ${PAID_FLAG} -- "\
-            [ -f \$HOME/.crave_env ] && source \$HOME/.crave_env && \
-            export INPUT_SKIP_SYNC='${INPUT_SKIP_SYNC}' && \
-            export INPUT_RUN_RESET='${INPUT_RUN_RESET}' && \
-            export INPUT_BUILD_MODULE='${INPUT_BUILD_MODULE}' && \
-            export INPUT_TREE_OVERRIDES='${INPUT_TREE_OVERRIDES}' && \
-            export INPUT_MANIFEST_BRANCH='${INPUT_MANIFEST_BRANCH}' && \
-            curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt-secure.sh | bash -s --" 2>&1 | tee "$OUTFILE"
+            curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash -s -- ${BUILD_COMMAND}" 2>&1 | tee "$LOG_FILE"
           EXIT_CODE=${PIPESTATUS[0]}
           set -e
 
-          TAIL_OUTPUT=$(tail -20 "$OUTFILE")
-          rm -f "$OUTFILE"
+          # Stop the monitor
+          kill "$MONITOR_PID" 2>/dev/null || true
+          wait "$MONITOR_PID" 2>/dev/null || true
+
+          TAIL_OUTPUT=$(tail -20 "$LOG_FILE")
 
           # ── SUCCESS ──
           if [[ $EXIT_CODE -eq 0 ]]; then
             echo ""
             echo "✅ Build succeeded on attempt ${attempt}!"
+
+            # ── PULL BUILD ARTIFACTS ──
+            echo "📥 Pulling build artifacts from build cluster..."
+            crave ${{ secrets.CRAVE_FLAGS }} pull "out/target/product/lemonade/Lunaris-AOSP-lemonade*.zip" 2>&1 || true
+
+            # Find the pulled zip
+            PULLED_ZIP=$(find . -maxdepth 1 -name "Lunaris-AOSP-lemonade*.zip" -type f 2>/dev/null | head -1)
+
+            if [[ -n "$PULLED_ZIP" && -f "$PULLED_ZIP" ]]; then
+              FILENAME=$(basename "$PULLED_ZIP")
+              echo "✅ Pulled: $FILENAME"
+
+              # ── UPLOAD TO ZDRIVE ──
+              echo "📤 Uploading $FILENAME to zdrive..."
+              UPLOAD_LOG=$(zdrive "$PULLED_ZIP" 2>&1)
+              DOWNLOAD_LINK=$(echo "$UPLOAD_LOG" | grep -o 'https://zdrive.to/[a-zA-Z0-9_-]*')
+
+              if [[ -n "$DOWNLOAD_LINK" ]]; then
+                echo "✅ Upload complete: $DOWNLOAD_LINK"
+
+                # Send download link to Telegram
+                curl -s -X POST \
+                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                  --data-urlencode "text=📦 <b>Build Complete!</b>
+
+• <b>File:</b> ${FILENAME}
+• <b>Download:</b> <a href=\"${DOWNLOAD_LINK}\">${DOWNLOAD_LINK}</a>
+
+✅ <b>Command:</b> <code>${BUILD_COMMAND}</code>" \
+                  -d "parse_mode=HTML" \
+                  -d "disable_web_page_preview=true" || true
+              else
+                echo "⚠️ zdrive upload failed"
+                echo "$UPLOAD_LOG"
+
+                curl -s -X POST \
+                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                  --data-urlencode "text=⚠️ <b>Build succeeded but zdrive upload failed!</b>
+
+• <b>File:</b> ${FILENAME}
+• <b>Command:</b> <code>${BUILD_COMMAND}</code>
+
+Check GitHub Actions logs for details." \
+                  -d "parse_mode=HTML" || true
+              fi
+
+              # Clean up pulled file
+              rm -f "$PULLED_ZIP"
+            else
+              echo "⚠️ No zip found after crave pull"
+              curl -s -X POST \
+                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                --data-urlencode "text=⚠️ <b>Build succeeded but no ROM zip found to pull!</b>
+
+• <b>Command:</b> <code>${BUILD_COMMAND}</code>" \
+                -d "parse_mode=HTML" || true
+            fi
+
             exit 0
           fi
 
@@ -335,6 +381,21 @@ jobs:
           # ── REAL BUILD FAILURE → DON'T RETRY ──
           echo ""
           echo "❌ Real build failure (exit: ${EXIT_CODE}) — not retrying"
+
+          # Send last 50 lines of log to Telegram
+          LAST_LINES=$(tail -50 "$LOG_FILE" 2>/dev/null || echo "No log available")
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=❌ <b>Build Failed</b>
+
+• <b>Exit Code:</b> ${EXIT_CODE}
+• <b>Command:</b> <code>${BUILD_COMMAND}</code>
+
+<b>Last lines:</b>
+<pre>$(echo "$LAST_LINES" | tail -20 | head -c 3000)</pre>" \
+            -d "parse_mode=HTML" || true
+
           exit $EXIT_CODE
         done
       timeout-minutes: 720
@@ -342,11 +403,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         ZDRIVE_API_KEY: ${{ secrets.ZDRIVE_API_KEY }}
-        INPUT_SKIP_SYNC: ${{ github.event.inputs.SKIP_SYNC }}
-        INPUT_RUN_RESET: ${{ github.event.inputs.RUN_RESET }}
-        INPUT_BUILD_MODULE: ${{ github.event.inputs.BUILD_MODULE }}
-        INPUT_TREE_OVERRIDES: ${{ github.event.inputs.TREE_OVERRIDES }}
-        INPUT_MANIFEST_BRANCH: ${{ github.event.inputs.MANIFEST_BRANCH }}
+        INPUT_BUILD_COMMAND: ${{ github.event.inputs.BUILD_COMMAND }}
 
     # ── Post-build Telegram notifications ──
     - name: Telegram — Success
@@ -356,7 +413,7 @@ jobs:
         curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=✅ *Lunaris Build Succeeded!*%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A[View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+          -d "text=✅ *Lunaris Build Succeeded!*%0ACommand: \`${{ github.event.inputs.BUILD_COMMAND }}\`%0A[View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
           -d "parse_mode=Markdown" \
           -d "disable_web_page_preview=true"
       env:
@@ -371,7 +428,7 @@ jobs:
         curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=${S} *Lunaris Build*%0AModule: ${{ github.event.inputs.BUILD_MODULE }}%0A[View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+          -d "text=${S} *Lunaris Build*%0ACommand: \`${{ github.event.inputs.BUILD_COMMAND }}\`%0A[View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
           -d "parse_mode=Markdown" \
           -d "disable_web_page_preview=true"
       env:
