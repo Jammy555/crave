@@ -16,7 +16,7 @@
 #    TELEGRAM_CHAT_ID, ZDRIVE_API_KEY
 #
 #  OPTIONAL SECRETS:
-#    CRAVE_FLAGS, CUSTOM_YAML, PAID
+#    CRAVE_FLAGS, PAID
 #
 
 name: Lunaris Build System
@@ -25,19 +25,19 @@ on:
   workflow_dispatch:
     inputs:
       BUILD_COMMAND:
-        description: 'Build command args (e.g. "bacon", "--nosync --nosyncd bacon", "--reset --tree1=kernel:test bacon")'
+        description: 'Build args (e.g. "bacon", "--nosync --nosyncd bacon", "--reset --tree1=kernel:test bacon")'
         required: true
         default: 'bacon'
         type: string
 
       MAX_RETRIES:
-        description: 'Max retries on instant crave failure (Total time: 0s)'
+        description: 'Max retries on crave glitch (Total time: 0s or empty output)'
         required: true
         default: '5'
         type: string
 
       RUNNER_TOKEN:
-        description: 'Optional runner token (only needed if setting up a new runner from scratch)'
+        description: 'Optional runner token (only needed for first-time runner setup)'
         required: false
         default: ''
         type: string
@@ -45,9 +45,6 @@ on:
 jobs:
   # ═══════════════════════════════════════════════════════════════════════
   # JOB 1: SMART RUNNER DETECTION & AUTO-START
-  # Detects if runner is alive inside crave devspace; restarts if stopped;
-  # or sets up a new runner if RUNNER_TOKEN is provided.
-  # Uses 30s timeout so connection NEVER hangs.
   # ═══════════════════════════════════════════════════════════════════════
   runner-setup:
     name: "🔧 Runner Check & Auto-Start"
@@ -85,19 +82,19 @@ jobs:
         status=0
         timeout 35s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
           if [ -d \$HOME/actions-runner ] && [ -f \$HOME/actions-runner/run.sh ]; then
-            echo '✅ Runner binary found at \$HOME/actions-runner'
+            echo 'Runner binary found'
             if tmux has-session -t ghactions 2>/dev/null && pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
-              echo '✅ Self-hosted runner is active and listening for jobs'
+              echo 'Self-hosted runner is active'
             else
-              echo '⚠️ Runner session dead or stopped. Restarting runner in tmux...'
+              echo 'Runner session dead. Restarting...'
               tmux kill-session -t ghactions 2>/dev/null || true
               tmux new-session -d -s ghactions
               tmux send-keys -t ghactions 'cd \$HOME/actions-runner && ./run.sh' Enter
               sleep 2
-              echo '✅ Runner restarted in tmux session ghactions'
+              echo 'Runner restarted'
             fi
           elif [ -n \"$RUNNER_TOKEN\" ]; then
-            echo '⚠️ Setting up new self-hosted runner with provided token...'
+            echo 'Setting up new self-hosted runner...'
             mkdir -p \$HOME/actions-runner && cd \$HOME/actions-runner
             RUNNER_VER=\$(curl -s 'https://api.github.com/repos/actions/runner/releases/latest' | grep -oP '\"tag_name\": \"v\K[^\"]*')
             curl -sL -o runner.tar.gz \"https://github.com/actions/runner/releases/download/v\${RUNNER_VER}/actions-runner-linux-x64-\${RUNNER_VER}.tar.gz\"
@@ -106,18 +103,17 @@ jobs:
             tmux kill-session -t ghactions 2>/dev/null || true
             tmux new-session -d -s ghactions
             tmux send-keys -t ghactions './run.sh' Enter
-            echo '✅ New runner installed and started'
+            echo 'New runner installed and started'
           else
-            echo '❌ Runner not installed in \$HOME/actions-runner and no RUNNER_TOKEN provided.'
-            echo '   Please set up runner manually or supply RUNNER_TOKEN in workflow options.'
+            echo 'Runner not installed and no RUNNER_TOKEN provided.'
             exit 1
           fi
         " || status=$?
 
         if [[ "$status" -eq 124 || "$status" -eq 0 ]]; then
-          echo "✅ Runner check/start finished."
+          echo "Runner check/start finished."
         else
-          echo "❌ Runner check failed (exit code: $status)"
+          echo "Runner check failed (exit code: $status)"
           exit $status
         fi
 
@@ -137,7 +133,7 @@ jobs:
         if [[ -n "$MISSING" ]]; then
           echo "::error::Missing secrets:"; echo -e "$MISSING"; exit 1
         fi
-        echo "✅ All secrets configured"
+        echo "All secrets configured"
 
     - name: Show config
       run: |
@@ -147,7 +143,6 @@ jobs:
   # ═══════════════════════════════════════════════════════════════════════
   # JOB 3: BUILD
   # Runs on the self-hosted runner inside crave devspace.
-  # Finds/creates clone → crave run → monitor → pull → upload.
   #
   # SECURITY: No secrets are passed into `crave run`. volt.sh is a
   # pure build script. Telegram/zdrive happen on the runner side ONLY.
@@ -161,7 +156,6 @@ jobs:
       group: ${{ github.repository_owner }}
 
     steps:
-    # ── Find or create the project clone (NEVER destroys) ──
     - name: Find or create project clone
       run: |
         echo "Checking for existing crave clones in /crave-devspaces/..."
@@ -174,34 +168,30 @@ jobs:
         done
 
         if [[ -n "$CLONE_PATH" && -d "$CLONE_PATH" ]]; then
-          echo "✅ Found existing clone at: $CLONE_PATH"
+          echo "Found existing clone at: $CLONE_PATH"
         else
-          echo "⚠️ No clone found. Creating one..."
+          echo "No clone found. Creating one..."
           CLONE_PATH="/crave-devspaces/Lineage22.1"
           crave clone create --projectID 93 "$CLONE_PATH" || true
-          echo "✅ Clone ready at: $CLONE_PATH"
+          echo "Clone ready at: $CLONE_PATH"
         fi
 
         echo "PROJECTFOLDER=$CLONE_PATH" >> "$GITHUB_ENV"
 
-    # ── Notify via Telegram ──
     - name: Telegram — Build Started
       continue-on-error: true
       run: |
-        MSG="🚀 *Lunaris Build Started*
-
-        📦 Command: \`${{ github.event.inputs.BUILD_COMMAND }}\`
-        📁 Clone: ${PROJECTFOLDER}
-        🔁 Max Retries: ${{ github.event.inputs.MAX_RETRIES }}
-
-        [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-
-        curl -s -X POST \
-          "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        MSG="$(printf '🚀 <b>Lunaris Build Started</b>\n\nCommand: <code>%s</code>\nClone: %s\nMax Retries: %s\n\n<a href="https://github.com/%s/actions/runs/%s">View Run</a>' \
+          "${{ github.event.inputs.BUILD_COMMAND }}" \
+          "${PROJECTFOLDER}" \
+          "${{ github.event.inputs.MAX_RETRIES }}" \
+          "${{ github.repository }}" \
+          "${{ github.run_id }}")"
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          --data-urlencode "text=${MSG}" \
-          -d "parse_mode=Markdown" \
-          -d "disable_web_page_preview=true"
+          -d "parse_mode=HTML" \
+          -d "disable_web_page_preview=true" \
+          --data-urlencode "text=${MSG}" || true
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -211,7 +201,6 @@ jobs:
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
-    # ── Install zdrive on the runner (devspace) ──
     - name: Setup zdrive CLI
       run: |
         if ! command -v zdrive &> /dev/null; then
@@ -224,11 +213,7 @@ jobs:
       env:
         ZDRIVE_API_KEY: ${{ secrets.ZDRIVE_API_KEY }}
 
-    # ── THE BUILD — with auto-retry for instant crave failures ──
-    #
-    # SECURITY: No secrets in the crave run command. volt.sh streams
-    # structured status to stdout. monitor.sh reads it and sends
-    # Telegram updates using secrets that stay on the runner.
+    # ── THE BUILD — no secrets in crave run ──
     - name: Run build (auto-retry on crave glitches)
       run: |
         set +x
@@ -245,20 +230,26 @@ jobs:
         MAX_RETRIES=${{ github.event.inputs.MAX_RETRIES }}
         RETRY_DELAY=30
 
+        # Telegram helper — builds message in variable first, safe for YAML
+        tg_send() {
+          local msg="$1"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=HTML" \
+            -d "disable_web_page_preview=true" \
+            --data-urlencode "text=${msg}" > /dev/null 2>&1 || true
+        }
+
         for attempt in $(seq 1 "$MAX_RETRIES"); do
           echo ""
-          echo "════════════════════════════════════════════════════"
-          echo "  ATTEMPT ${attempt}/${MAX_RETRIES}"
-          echo "  Command: ${BUILD_COMMAND}"
-          echo "════════════════════════════════════════════════════"
-          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  ATTEMPT ${attempt}/${MAX_RETRIES}  |  ${BUILD_COMMAND}"
+          echo "════════════════════════════════════════════"
 
-          # Clean previous log
           rm -f "$LOG_FILE"
           touch "$LOG_FILE"
 
-          # Download and start the background Telegram monitor
-          # It reads the log file and sends progress updates
+          # Download and start background Telegram monitor
           MONITOR_SCRIPT="/tmp/volt_monitor_$$.sh"
           curl -LSs "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/monitor.sh" -o "$MONITOR_SCRIPT"
           chmod +x "$MONITOR_SCRIPT"
@@ -266,15 +257,14 @@ jobs:
           MONITOR_PID=$!
           echo "Monitor started (PID: $MONITOR_PID)"
 
-          # Run the build — NO SECRETS in this command!
-          # volt.sh is a pure build script, all status goes to stdout.
+          # Run the build — NO SECRETS in this command
           set +e
-          crave ${{ secrets.CRAVE_FLAGS }} run --no-patch ${PAID_FLAG} -- "\
-            curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash -s -- ${BUILD_COMMAND}" 2>&1 | tee "$LOG_FILE"
+          crave ${{ secrets.CRAVE_FLAGS }} run --no-patch ${PAID_FLAG} -- \
+            "curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash -s -- ${BUILD_COMMAND}" \
+            2>&1 | tee "$LOG_FILE"
           EXIT_CODE=${PIPESTATUS[0]}
           set -e
 
-          # Stop the monitor
           kill "$MONITOR_PID" 2>/dev/null || true
           wait "$MONITOR_PID" 2>/dev/null || true
 
@@ -283,144 +273,84 @@ jobs:
 
           # ── SUCCESS ──
           if [[ $EXIT_CODE -eq 0 ]]; then
-            echo ""
-            echo "✅ Build succeeded on attempt ${attempt}!"
+            echo "Build succeeded on attempt ${attempt}!"
 
-            # ── PULL BUILD ARTIFACTS ──
-            echo "📥 Pulling build artifacts from build cluster..."
+            echo "Pulling build artifacts..."
             crave ${{ secrets.CRAVE_FLAGS }} pull "out/target/product/lemonade/Lunaris-AOSP-lemonade*.zip" 2>&1 || true
 
-            # Find the pulled zip
             PULLED_ZIP=$(find . -maxdepth 1 -name "Lunaris-AOSP-lemonade*.zip" -type f 2>/dev/null | head -1)
 
             if [[ -n "$PULLED_ZIP" && -f "$PULLED_ZIP" ]]; then
               FILENAME=$(basename "$PULLED_ZIP")
-              echo "✅ Pulled: $FILENAME"
+              echo "Pulled: $FILENAME"
 
-              # ── UPLOAD TO ZDRIVE ──
-              echo "📤 Uploading $FILENAME to zdrive..."
+              echo "Uploading to zdrive..."
               UPLOAD_LOG=$(zdrive "$PULLED_ZIP" 2>&1)
               DOWNLOAD_LINK=$(echo "$UPLOAD_LOG" | grep -o 'https://zdrive.to/[a-zA-Z0-9_-]*')
 
               if [[ -n "$DOWNLOAD_LINK" ]]; then
-                echo "✅ Upload complete: $DOWNLOAD_LINK"
-
-                # Send download link to Telegram
-                curl -s -X POST \
-                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                  -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                  --data-urlencode "text=📦 <b>Build Complete!</b>
-
-• <b>File:</b> ${FILENAME}
-• <b>Download:</b> <a href=\"${DOWNLOAD_LINK}\">${DOWNLOAD_LINK}</a>
-
-✅ <b>Command:</b> <code>${BUILD_COMMAND}</code>" \
-                  -d "parse_mode=HTML" \
-                  -d "disable_web_page_preview=true" || true
+                echo "Upload complete: $DOWNLOAD_LINK"
+                MSG="$(printf '📦 <b>Build Complete!</b>\n\nFile: %s\nDownload: <a href="%s">%s</a>\n\nCommand: <code>%s</code>' \
+                  "$FILENAME" "$DOWNLOAD_LINK" "$DOWNLOAD_LINK" "$BUILD_COMMAND")"
               else
-                echo "⚠️ zdrive upload failed"
-                echo "$UPLOAD_LOG"
-
-                curl -s -X POST \
-                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                  -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                  --data-urlencode "text=⚠️ <b>Build succeeded but zdrive upload failed!</b>
-
-• <b>File:</b> ${FILENAME}
-• <b>Command:</b> <code>${BUILD_COMMAND}</code>
-
-Check GitHub Actions logs for details." \
-                  -d "parse_mode=HTML" || true
+                echo "zdrive upload failed: $UPLOAD_LOG"
+                MSG="$(printf '⚠️ <b>Build OK but zdrive upload failed!</b>\n\nFile: %s\nCommand: <code>%s</code>\n\nCheck Actions logs for details.' \
+                  "$FILENAME" "$BUILD_COMMAND")"
               fi
-
-              # Clean up pulled file
+              tg_send "$MSG"
               rm -f "$PULLED_ZIP"
             else
-              echo "⚠️ No zip found after crave pull"
-              curl -s -X POST \
-                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                --data-urlencode "text=⚠️ <b>Build succeeded but no ROM zip found to pull!</b>
-
-• <b>Command:</b> <code>${BUILD_COMMAND}</code>" \
-                -d "parse_mode=HTML" || true
+              echo "No zip found after crave pull"
+              MSG="$(printf '⚠️ <b>Build succeeded but no ROM zip found!</b>\n\nCommand: <code>%s</code>' "$BUILD_COMMAND")"
+              tg_send "$MSG"
             fi
 
             exit 0
           fi
 
-          # ── DECIDE: CRAVE GLITCH (retry) vs REAL FAILURE (no retry) ──
+          # ── DECIDE: CRAVE GLITCH vs REAL FAILURE ──
           #
-          # RETRY only when the output contains the exact crave glitch signature:
-          #   "Build Failed" + "Total time: 0s"  → crave never dispatched a worker
-          # OR when the log is completely empty → crave didn't connect at all.
-          #
-          # Everything else = real build failure. Send the log, exit.
+          # Retry ONLY when output matches the exact crave glitch signature:
+          #   "Build Failed" + "Total time: 0s" (crave never dispatched a worker)
+          # OR output is completely empty (crave never connected).
+          # Everything else = real failure. Send log. Exit immediately.
 
           IS_CRAVE_GLITCH=0
-
-          # Case 1: classic instant failure signature
-          if echo "$TAIL_OUTPUT" | grep -qF "Total time: 0s" && \
-             echo "$TAIL_OUTPUT" | grep -qF "Build Failed"; then
+          if echo "$TAIL_OUTPUT" | grep -qF "Total time: 0s" && echo "$TAIL_OUTPUT" | grep -qF "Build Failed"; then
             IS_CRAVE_GLITCH=1
           fi
-
-          # Case 2: empty output (crave returned nothing at all)
           if [[ "$FULL_OUTPUT_LINES" -eq 0 || -z "$TAIL_OUTPUT" ]]; then
             IS_CRAVE_GLITCH=1
           fi
 
           if [[ $IS_CRAVE_GLITCH -eq 1 ]]; then
-            echo ""
-            echo "⚠️ Crave glitch detected (no real build started) — attempt ${attempt}/${MAX_RETRIES}"
-            echo "   Output lines: ${FULL_OUTPUT_LINES}, exit: ${EXIT_CODE}"
+            echo "Crave glitch (no real build started) — attempt ${attempt}/${MAX_RETRIES}"
+            echo "  Output lines: ${FULL_OUTPUT_LINES}  exit: ${EXIT_CODE}"
 
             if [[ $attempt -lt $MAX_RETRIES ]]; then
-              echo "   Retrying in ${RETRY_DELAY}s..."
-
-              curl -s -X POST \
-                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                --data-urlencode "text=🔄 <b>Crave glitch — build never started</b>
-Attempt ${attempt}/${MAX_RETRIES} — retrying in ${RETRY_DELAY}s...
-
-<code>${TAIL_OUTPUT:-(empty output)}</code>" \
-                -d "parse_mode=HTML" > /dev/null 2>&1 || true
-
+              echo "  Retrying in ${RETRY_DELAY}s..."
+              SNIPPET="${TAIL_OUTPUT:-(empty output)}"
+              MSG="$(printf '🔄 <b>Crave glitch — build never started</b>\nAttempt %s/%s, retrying in %ss\n\n<code>%s</code>' \
+                "$attempt" "$MAX_RETRIES" "$RETRY_DELAY" "${SNIPPET:0:500}")"
+              tg_send "$MSG"
               sleep "$RETRY_DELAY"
               continue
             else
-              echo "   ❌ All ${MAX_RETRIES} glitch retries exhausted"
-
-              curl -s -X POST \
-                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                -d "chat_id=${TELEGRAM_CHAT_ID}" \
-                --data-urlencode "text=❌ <b>All ${MAX_RETRIES} crave attempts failed — never got a worker</b>
-
-<code>${TAIL_OUTPUT:-(empty output)}</code>" \
-                -d "parse_mode=HTML" > /dev/null 2>&1 || true
-
+              echo "  All ${MAX_RETRIES} glitch retries exhausted"
+              SNIPPET="${TAIL_OUTPUT:-(empty output)}"
+              MSG="$(printf '❌ <b>All %s crave retries failed — never got a worker</b>\n\n<code>%s</code>' \
+                "$MAX_RETRIES" "${SNIPPET:0:500}")"
+              tg_send "$MSG"
               exit 1
             fi
           fi
 
-          # ── REAL BUILD FAILURE → never retry, always send log ──
-          echo ""
-          echo "❌ Real build failure (exit: ${EXIT_CODE}) — not retrying"
-
+          # ── REAL BUILD FAILURE — send log, no retry ──
+          echo "Real build failure (exit: ${EXIT_CODE}) — not retrying"
           LAST_LINES=$(tail -30 "$LOG_FILE" 2>/dev/null || echo "No log available")
-          curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=❌ <b>Build Failed</b>
-
-• <b>Exit Code:</b> ${EXIT_CODE}
-• <b>Command:</b> <code>${BUILD_COMMAND}</code>
-
-<b>Last log lines:</b>
-<pre>$(echo "$LAST_LINES" | head -c 3000)</pre>" \
-            -d "parse_mode=HTML" || true
-
+          MSG="$(printf '❌ <b>Build Failed</b>\n\nExit Code: %s\nCommand: <code>%s</code>\n\n<b>Last lines:</b>\n<pre>%s</pre>' \
+            "$EXIT_CODE" "$BUILD_COMMAND" "${LAST_LINES:0:2500}")"
+          tg_send "$MSG"
           exit $EXIT_CODE
         done
       timeout-minutes: 720
@@ -430,17 +360,17 @@ Attempt ${attempt}/${MAX_RETRIES} — retrying in ${RETRY_DELAY}s...
         ZDRIVE_API_KEY: ${{ secrets.ZDRIVE_API_KEY }}
         INPUT_BUILD_COMMAND: ${{ github.event.inputs.BUILD_COMMAND }}
 
-    # ── Post-build Telegram notifications ──
     - name: Telegram — Success
       if: ${{ success() }}
       continue-on-error: true
       run: |
-        curl -s -X POST \
-          "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        MSG="$(printf '✅ <b>Lunaris Build Succeeded!</b>\nCommand: <code>%s</code>\n<a href="https://github.com/%s/actions/runs/%s">View Run</a>' \
+          "${{ github.event.inputs.BUILD_COMMAND }}" "${{ github.repository }}" "${{ github.run_id }}")"
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=✅ *Lunaris Build Succeeded!*%0ACommand: \`${{ github.event.inputs.BUILD_COMMAND }}\`%0A[View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-          -d "parse_mode=Markdown" \
-          -d "disable_web_page_preview=true"
+          -d "parse_mode=HTML" \
+          -d "disable_web_page_preview=true" \
+          --data-urlencode "text=${MSG}" || true
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -450,12 +380,13 @@ Attempt ${attempt}/${MAX_RETRIES} — retrying in ${RETRY_DELAY}s...
       continue-on-error: true
       run: |
         [[ "${{ job.status }}" == "cancelled" ]] && S="🛑 Cancelled" || S="❌ Failed"
-        curl -s -X POST \
-          "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        MSG="$(printf '%s <b>Lunaris Build</b>\nCommand: <code>%s</code>\n<a href="https://github.com/%s/actions/runs/%s">View Run</a>' \
+          "$S" "${{ github.event.inputs.BUILD_COMMAND }}" "${{ github.repository }}" "${{ github.run_id }}")"
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "text=${S} *Lunaris Build*%0ACommand: \`${{ github.event.inputs.BUILD_COMMAND }}\`%0A[View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-          -d "parse_mode=Markdown" \
-          -d "disable_web_page_preview=true"
+          -d "parse_mode=HTML" \
+          -d "disable_web_page_preview=true" \
+          --data-urlencode "text=${MSG}" || true
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
