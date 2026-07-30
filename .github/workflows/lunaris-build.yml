@@ -25,9 +25,9 @@ on:
   workflow_dispatch:
     inputs:
       BUILD_COMMAND:
-        description: 'Build args (e.g. "bacon", "--nosync --nosyncd bacon", "--reset --tree1=kernel:test bacon")'
-        required: true
-        default: 'bacon'
+        description: 'Build args (e.g. "--nosync --nosyncd", "--reset --tree1=kernel:test", leave empty for default bacon build)'
+        required: false
+        default: ''
         type: string
 
       MAX_RETRIES:
