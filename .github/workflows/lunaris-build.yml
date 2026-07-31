@@ -446,37 +446,6 @@ jobs:
         ZDRIVE_API_KEY: ${{ secrets.ZDRIVE_API_KEY }}
         INPUT_BUILD_COMMAND: ${{ github.event.inputs.BUILD_COMMAND }}
 
-    - name: Telegram — Success
-      if: ${{ success() }}
-      continue-on-error: true
-      run: |
-        MSG="$(printf '✅ <b>Lunaris Build Succeeded!</b>\nCommand: <code>%s</code>\n<a href="https://github.com/%s/actions/runs/%s">View Run</a>' \
-          "${{ github.event.inputs.BUILD_COMMAND }}" "${{ github.repository }}" "${{ github.run_id }}")"
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "parse_mode=HTML" \
-          -d "disable_web_page_preview=true" \
-          --data-urlencode "text=${MSG}" || true
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-    - name: Telegram — Failed/Cancelled
-      if: ${{ failure() || cancelled() }}
-      continue-on-error: true
-      run: |
-        [[ "${{ job.status }}" == "cancelled" ]] && S="🛑 Cancelled" || S="❌ Failed"
-        MSG="$(printf '%s <b>Lunaris Build</b>\nCommand: <code>%s</code>\n<a href="https://github.com/%s/actions/runs/%s">View Run</a>' \
-          "$S" "${{ github.event.inputs.BUILD_COMMAND }}" "${{ github.repository }}" "${{ github.run_id }}")"
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "parse_mode=HTML" \
-          -d "disable_web_page_preview=true" \
-          --data-urlencode "text=${MSG}" || true
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
     - name: Stop crave on cancel
       if: ${{ cancelled() }}
       run: cd "$PROJECTFOLDER" && crave stop --all
