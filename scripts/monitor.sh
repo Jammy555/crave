@@ -312,25 +312,19 @@ poll_commands() {
 
     # Advance offset
     local last_id
-    last_id=$(echo "$resp" | grep -o '"update_id":[0-9]*' | tail -1 | cut -d: -f2)
+    last_id=$(echo "$resp" | jq -r '.result[-1].update_id // empty')
     [[ -n "$last_id" ]] && TG_OFFSET=$last_id
 
     # ── Callback queries (inline button presses) ────────────────────────────
-    # Extract callback_query id and data using sed-based extraction
-    # (JSON can have nested braces — grep -o with [^}]* would break)
-    local cb_data_list
-    cb_data_list=$(echo "$resp" | grep -o '"callback_query"[^}]*"data":"[^"]*"' \
-        | grep -o '"data":"[^"]*"' | cut -d'"' -f4)
-    local cb_id_list
-    cb_id_list=$(echo "$resp" | grep -o '"callback_query"[^}]*"id":"[^"]*"' \
-        | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-
-    # Process each callback
-    local i=0
-    for cb_data in $cb_data_list; do
-        i=$((i+1))
-        local cb_id
-        cb_id=$(echo "$cb_id_list" | sed -n "${i}p")
+    local callbacks
+    callbacks=$(echo "$resp" | jq -c '.result[] | select(.callback_query != null) | {id: .callback_query.id, data: .callback_query.data}')
+    
+    while IFS= read -r cb; do
+        [[ -z "$cb" ]] && continue
+        local cb_id cb_data
+        cb_id=$(echo "$cb" | jq -r '.id // empty')
+        cb_data=$(echo "$cb" | jq -r '.data // empty')
+        
         dbg "Callback: data=$cb_data id=$cb_id"
 
         # Answer the callback to dismiss spinner
@@ -339,14 +333,15 @@ poll_commands() {
             -d "text=✅ Done" > /dev/null
 
         handle_command "$cb_data"
-    done
+    done <<< "$callbacks"
 
     # ── Text messages (e.g. /refresh typed in chat) ─────────────────────────
     local texts
-    texts=$(echo "$resp" | grep -o '"text":"[^"]*"' | cut -d'"' -f4)
-    for cmd in $texts; do
+    texts=$(echo "$resp" | jq -r '.result[] | select(.message.text != null) | .message.text')
+    while IFS= read -r cmd; do
+        [[ -z "$cmd" ]] && continue
         handle_command "$cmd"
-    done
+    done <<< "$texts"
 }
 
 handle_command() {
