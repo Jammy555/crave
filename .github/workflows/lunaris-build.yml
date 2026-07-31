@@ -33,7 +33,7 @@ on:
       MAX_RETRIES:
         description: 'Max retries on crave glitch (Total time: 0s or empty output)'
         required: true
-        default: '5'
+        default: '2'
         type: string
 
       RUNNER_TOKEN:
@@ -157,7 +157,7 @@ jobs:
   # JOB 2: INPUT VALIDATION
   # ═══════════════════════════════════════════════════════════════════════
   validate:
-    name: "✅ Validate Inputs"
+    name: "Validate Inputs"
     runs-on: ubuntu-latest
     steps:
     - name: Check secrets
@@ -289,7 +289,7 @@ jobs:
           MONITOR_SCRIPT="/tmp/volt_monitor_$$.sh"
           curl -LSs "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/monitor.sh" -o "$MONITOR_SCRIPT"
           chmod +x "$MONITOR_SCRIPT"
-          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$$" &
+          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$$" "$PROJECTFOLDER" &
           MONITOR_PID=$!
           echo "Monitor started (PID: $MONITOR_PID)"
 
