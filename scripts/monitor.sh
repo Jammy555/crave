@@ -254,31 +254,62 @@ send_failure_log() {
 
 # ─── Telegram command polling ───────────────────────────────────────────────
 poll_commands() {
-    local resp update_id text
-    resp=$(_curl_tg "getUpdates" -d "offset=$((TG_OFFSET+1))" -d "limit=5" -d "timeout=0" 2>/dev/null)
-    local ids texts
-    ids=$(echo "$resp" | grep -o '"update_id":[0-9]*' | cut -d: -f2)
-    texts=$(echo "$resp" | grep -o '"text":"[^"]*"' | cut -d'"' -f4)
+    local resp
+    resp=$(_curl_tg "getUpdates" -d "offset=$((TG_OFFSET+1))" -d "limit=10" -d "timeout=0" 2>/dev/null)
+    [[ -z "$resp" ]] && return
 
+    # Advance offset to avoid re-processing
     local last_id
-    last_id=$(echo "$ids" | tail -1)
+    last_id=$(echo "$resp" | grep -o '"update_id":[0-9]*' | tail -1 | cut -d: -f2)
     [[ -n "$last_id" ]] && TG_OFFSET=$last_id
 
+    # ── Handle inline keyboard button presses (callback_query) ──────────────
+    # Format in getUpdates: {"callback_query":{"id":"...","data":"refresh",...}}
+    local cb_ids cb_datas
+    # Extract all callback_query ids and data values
+    while IFS= read -r line; do
+        local cb_id cb_data
+        cb_id=$(echo "$line"   | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+        cb_data=$(echo "$line" | grep -o '"data":"[^"]*"' | head -1 | cut -d'"' -f4)
+        [[ -z "$cb_data" ]] && continue
+
+        echo "Button pressed: $cb_data"
+
+        # Dismiss the loading spinner on the button
+        [[ -n "$cb_id" ]] && _curl_tg "answerCallbackQuery" \
+            -d "callback_query_id=${cb_id}" \
+            -d "text=✅ Done" > /dev/null
+
+        # Handle the action
+        handle_command "$cb_data"
+    done < <(echo "$resp" | grep -o '"callback_query":{[^}]*}')
+
+    # ── Handle plain text commands (e.g. /refresh typed in chat) ────────────
+    local texts
+    texts=$(echo "$resp" | grep -o '"text":"[^"]*"' | cut -d'"' -f4)
     for cmd in $texts; do
-        case "$cmd" in
-            /refresh|refresh) force_publish ;;
-            /stats|stats)
-                LAST_STATS_EPOCH=0
-                publish_message
-                ;;
-            /stop|stop|/cancel|cancel)
-                CURRENT_DETAIL="🛑 Stop requested via Telegram"
-                force_publish
-                kill -TERM "$CRAVE_PID" 2>/dev/null || true
-                ;;
-        esac
+        handle_command "$cmd"
     done
 }
+
+handle_command() {
+    local cmd="$1"
+    case "$cmd" in
+        refresh|/refresh)
+            force_publish
+            ;;
+        stats|/stats)
+            LAST_STATS_EPOCH=0
+            publish_message
+            ;;
+        stop|/stop|cancel|/cancel)
+            CURRENT_DETAIL="🛑 Stop requested via Telegram"
+            force_publish
+            kill -TERM "$CRAVE_PID" 2>/dev/null || true
+            ;;
+    esac
+}
+
 
 # ─── Log parser ─────────────────────────────────────────────────────────────
 parse_line() {
