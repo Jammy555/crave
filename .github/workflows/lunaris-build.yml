@@ -184,7 +184,7 @@ jobs:
   # pure build script. Telegram/zdrive happen on the runner side ONLY.
   # ═══════════════════════════════════════════════════════════════════════
   build:
-    name: "🔨 Build LunarisOS"
+    name: "Build LunarisOS"
     timeout-minutes: 720
     needs: [runner-setup, validate]
     runs-on: self-hosted
@@ -192,6 +192,24 @@ jobs:
       group: ${{ github.repository_owner }}
 
     steps:
+    - name: Telegram — Build Started
+      continue-on-error: true
+      run: |
+        MSG="$(printf '🚀 <b>Lunaris Build Started</b>\n\nCommand: <code>%s</code>\nMax Retries: %s\n\n<a href="https://github.com/%s/actions/runs/%s">View Run</a>' \
+          "${INPUT_BUILD_COMMAND:-bacon}" \
+          "${{ github.event.inputs.MAX_RETRIES }}" \
+          "${{ github.repository }}" \
+          "${{ github.run_id }}")"
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          -d "chat_id=${TELEGRAM_CHAT_ID}" \
+          -d "parse_mode=HTML" \
+          -d "disable_web_page_preview=true" \
+          --data-urlencode "text=${MSG}" || true
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        INPUT_BUILD_COMMAND: ${{ github.event.inputs.BUILD_COMMAND }}
+
     - name: Find or create project clone
       run: |
         echo "Checking for existing crave clones in /crave-devspaces/..."
@@ -213,21 +231,6 @@ jobs:
         fi
 
         echo "PROJECTFOLDER=$CLONE_PATH" >> "$GITHUB_ENV"
-
-    - name: Telegram — Build Started
-      continue-on-error: true
-      run: |
-        MSG="$(printf '🚀 <b>Lunaris Build Started</b>\n\nCommand: <code>%s</code>\nClone: %s\nMax Retries: %s\n\n<a href="https://github.com/%s/actions/runs/%s">View Run</a>' \
-          "${{ github.event.inputs.BUILD_COMMAND }}" \
-          "${PROJECTFOLDER}" \
-          "${{ github.event.inputs.MAX_RETRIES }}" \
-          "${{ github.repository }}" \
-          "${{ github.run_id }}")"
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "parse_mode=HTML" \
-          -d "disable_web_page_preview=true" \
-          --data-urlencode "text=${MSG}" || true
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
