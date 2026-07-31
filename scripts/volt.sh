@@ -325,6 +325,9 @@ smart_clone() {
     log_status "Cloning Trees 🌲" "Fetching ${comp_name} (branch: ${branch})..."
 
     if [ -d "$target_dir" ]; then
+        # Bulletproof: clean up stale locks if a previous run crashed
+        rm -f "$target_dir/.git/"*.lock 2>/dev/null || true
+        
         retry "$CLONE_MAX_ATTEMPTS" "$CLONE_RETRY_DELAY" git -C "$target_dir" fetch --depth=1 "$repo_url" "$branch" \
             || die "Failed fetching ${comp_name} (branch '${branch}' on ${repo_url})"
         git -C "$target_dir" reset --hard FETCH_HEAD \
@@ -380,6 +383,8 @@ make_progress_bar() {
 # Cleans stale lock files left by killed or crashed builds
 clean_stale_locks() {
     find .repo -name '*.lock' -delete 2>/dev/null || true
+    # Remove git locks that might have been left behind during clone/fetch
+    find kernel device hardware vendor -type f -name '*.lock' -path '*/.git/*' -delete 2>/dev/null || true
     rm -f out/.ninja_lock out/soong/.soong.in_use out/.lock 2>/dev/null || true
 }
 
