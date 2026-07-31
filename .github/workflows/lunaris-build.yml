@@ -78,109 +78,119 @@ jobs:
       run: |
         RUNNER_TOKEN="${{ github.event.inputs.RUNNER_TOKEN }}"
         REPO="${{ github.repository }}"
+        RUNNER_NAME="crave-devspace"   # name registered with GitHub Actions
 
-        # ── Step 1: Ask GitHub API if runner is already online ──────────────
-        # If it's online, skip crave devspace entirely — zero overhead.
-        RUNNER_STATUS=$(curl -s \
-          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/${REPO}/actions/runners" \
-          | grep -A3 '"crave-devspace"' | grep '"status"' | head -1 \
-          | grep -o '"online"\|"offline"' | tr -d '"')
+        # ── Helper: query GitHub API for runner status ───────────────────────
+        check_runner_status() {
+          curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/actions/runners" \
+            | grep -A5 "\"${RUNNER_NAME}\"" | grep '"status"' | head -1 \
+            | grep -o '"online"\|"offline"' | tr -d '"'
+        }
 
-        echo "Runner status from GitHub API: ${RUNNER_STATUS:-unknown}"
+        # ── Step 1: Check if runner is already online ────────────────────────
+        RUNNER_STATUS=$(check_runner_status)
+        echo "Runner '${RUNNER_NAME}' status: ${RUNNER_STATUS:-unknown}"
 
         if [[ "$RUNNER_STATUS" == "online" ]]; then
-          echo "✅ Runner is already online — skipping devspace connection."
+          echo "✅ Runner is online — skipping devspace connection."
           exit 0
         fi
 
-        echo "Runner is ${RUNNER_STATUS:-unknown}. Connecting to devspace to restart..."
+        echo "Runner is offline or unknown. Connecting to devspace..."
 
-        # ── Step 2: Only reach here when runner is offline ──────────────────
+        # ── Step 2: Connect to whatever machine crave gives, start runner ────
+        # Even if crave switches machines (foss→fedora→etc), this always:
+        #   a) re-registers the runner on the NEW machine (config.sh --replace)
+        #   b) starts run.sh with nohup so it survives SSH disconnect
+        # No manual nohup needed ever again.
         status=0
-        timeout 60s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
+        timeout 90s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
           set -e
-
           RUNNER_DIR=\$HOME/actions-runner
           RUNNER_LOG=/tmp/runner.log
           RUNNER_PID_FILE=/tmp/runner.pid
+          REPO='${REPO}'
+          RUNNER_NAME='${RUNNER_NAME}'
 
-          runner_is_alive() {
-            if [ -f \"\$RUNNER_PID_FILE\" ]; then
-              local pid
-              pid=\$(cat \"\$RUNNER_PID_FILE\")
-              kill -0 \"\$pid\" 2>/dev/null && return 0
-            fi
-            pgrep -f 'Runner.Listener' >/dev/null 2>&1 && return 0
-            return 1
-          }
+          echo \"On machine: \$(hostname)\"
 
           start_runner() {
             pkill -f 'Runner.Listener' 2>/dev/null || true
-            pkill -f 'run.sh' 2>/dev/null || true
+            pkill -f 'run.sh'          2>/dev/null || true
             sleep 1
             cd \"\$RUNNER_DIR\"
             nohup bash run.sh > \"\$RUNNER_LOG\" 2>&1 &
             local pid=\$!
             disown \$pid
             echo \$pid > \"\$RUNNER_PID_FILE\"
-            echo \"Runner started PID \$pid\"
-            for i in \$(seq 1 25); do
+            echo \"Runner started — PID \$pid\"
+            # Wait locally up to 20s for Runner.Listener to appear
+            for i in \$(seq 1 20); do
               sleep 1
-              if pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
-                echo \"Runner.Listener confirmed after \${i}s\"
-                return 0
-              fi
+              pgrep -f 'Runner.Listener' >/dev/null 2>&1 && {
+                echo \"Runner.Listener up after \${i}s\"; return 0; }
             done
-            echo 'WARNING: Runner.Listener not seen after 25s'
-            tail -20 \"\$RUNNER_LOG\" 2>/dev/null || true
+            echo 'WARNING: Runner.Listener slow to start'; tail -15 \"\$RUNNER_LOG\" 2>/dev/null || true
           }
 
           if [ -d \"\$RUNNER_DIR\" ] && [ -f \"\$RUNNER_DIR/run.sh\" ]; then
-            echo 'Runner binary found'
-            if runner_is_alive; then
-              echo 'Runner process alive locally — may not yet show online in API'
+            echo 'Runner binary found on this machine'
+
+            # Always re-register if we have a token — handles machine switches.
+            # --replace quietly updates the registration for this new hostname.
+            if [ -n '${RUNNER_TOKEN}' ]; then
+              echo 'Re-registering runner (machine may have changed)...'
+              cd \"\$RUNNER_DIR\"
+              ./config.sh --unattended --url \"https://github.com/\${REPO}\" \
+                --token '${RUNNER_TOKEN}' --name \"\${RUNNER_NAME}\" \
+                --labels self-hosted,Linux,X64 --replace 2>&1 | tail -5
+            fi
+
+            if pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
+              echo 'Runner.Listener already running on this machine'
             else
-              echo 'Runner dead. Restarting with nohup...'
+              echo 'Starting runner...'
               start_runner
             fi
-          elif [ -n \"$RUNNER_TOKEN\" ]; then
-            echo 'First-time setup: installing runner...'
+
+          elif [ -n '${RUNNER_TOKEN}' ]; then
+            echo 'Runner not installed — fresh install on this machine...'
             mkdir -p \"\$RUNNER_DIR\" && cd \"\$RUNNER_DIR\"
-            RUNNER_VER=\$(curl -s 'https://api.github.com/repos/actions/runner/releases/latest' | grep -oP '\"tag_name\": \"v\K[^\"]*')
+            RUNNER_VER=\$(curl -s 'https://api.github.com/repos/actions/runner/releases/latest' \
+              | grep -oP '\"tag_name\": \"v\K[^\"]*')
             echo \"Downloading runner v\${RUNNER_VER}...\"
-            curl -sL -o runner.tar.gz \"https://github.com/actions/runner/releases/download/v\${RUNNER_VER}/actions-runner-linux-x64-\${RUNNER_VER}.tar.gz\"
+            curl -sL -o runner.tar.gz \
+              \"https://github.com/actions/runner/releases/download/v\${RUNNER_VER}/actions-runner-linux-x64-\${RUNNER_VER}.tar.gz\"
             tar xzf runner.tar.gz && rm -f runner.tar.gz
-            ./config.sh --unattended --url \"https://github.com/${REPO}\" --token \"$RUNNER_TOKEN\" --name crave-devspace --labels self-hosted,Linux,X64 --replace
-            echo 'Configured. Starting...'
+            ./config.sh --unattended --url \"https://github.com/\${REPO}\" \
+              --token '${RUNNER_TOKEN}' --name \"\${RUNNER_NAME}\" \
+              --labels self-hosted,Linux,X64 --replace
             start_runner
           else
-            echo 'ERROR: Runner not installed and no RUNNER_TOKEN provided.'
+            echo 'ERROR: Runner not installed on this machine and no RUNNER_TOKEN provided.'
+            echo 'Provide RUNNER_TOKEN in the workflow_dispatch inputs to auto-install.'
             exit 1
           fi
         " || status=$?
 
+        # ── Step 3: Poll GitHub API until runner shows online (up to 75s) ────
         if [[ "$status" -eq 124 || "$status" -eq 0 ]]; then
-          echo "Runner start triggered. Waiting for GitHub to see it as online..."
-          # Poll GitHub API every 5s up to 60s until runner is online
-          for i in $(seq 1 12); do
+          echo "Waiting for GitHub to confirm runner online..."
+          for i in $(seq 1 15); do
             sleep 5
-            API_STATUS=$(curl -s \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/actions/runners" \
-              | grep -A3 '"crave-devspace"' | grep '"status"' | head -1 \
-              | grep -o '"online"\|"offline"' | tr -d '"')
-            echo "  [${i}/12] Runner API status: ${API_STATUS:-unknown}"
+            API_STATUS=$(check_runner_status)
+            echo "  [${i}/15] ${RUNNER_NAME}: ${API_STATUS:-unknown}"
             if [[ "$API_STATUS" == "online" ]]; then
-              echo "✅ Runner is now online — ready to pick up build job."
+              echo "✅ Runner is now online."
               break
             fi
           done
         else
-          echo "Runner check failed (exit code: $status)"
-          exit $status
+          echo "Devspace connection failed (exit: $status) — runner may not start."
+          # Don't hard-fail; let the build job queue and wait
         fi
 
   # ═══════════════════════════════════════════════════════════════════════
