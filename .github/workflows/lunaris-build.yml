@@ -162,7 +162,22 @@ jobs:
         " || status=$?
 
         if [[ "$status" -eq 124 || "$status" -eq 0 ]]; then
-          echo "Runner check/start finished."
+          echo "Runner start triggered. Waiting for GitHub to see it as online..."
+          # Poll GitHub API every 5s up to 60s until runner is online
+          for i in $(seq 1 12); do
+            sleep 5
+            API_STATUS=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/actions/runners" \
+              | grep -A3 '"crave-devspace"' | grep '"status"' | head -1 \
+              | grep -o '"online"\|"offline"' | tr -d '"')
+            echo "  [${i}/12] Runner API status: ${API_STATUS:-unknown}"
+            if [[ "$API_STATUS" == "online" ]]; then
+              echo "✅ Runner is now online — ready to pick up build job."
+              break
+            fi
+          done
         else
           echo "Runner check failed (exit code: $status)"
           exit $status
