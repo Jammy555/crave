@@ -224,31 +224,13 @@ jobs:
   # ═══════════════════════════════════════════════════════════════════════
   build:
     name: "Build LunarisOS"
-    timeout-minutes: 720
+    timeout-minutes: 1440
     needs: [runner-setup, validate]
     runs-on: self-hosted
     concurrency:
       group: ${{ github.repository_owner }}
 
     steps:
-    - name: Telegram — Build Started
-      continue-on-error: true
-      run: |
-        MSG="$(printf '🚀 <b>Lunaris Build Started</b>\n\nCommand: <code>%s</code>\nMax Retries: %s\n\n<a href="https://github.com/%s/actions/runs/%s">View Run</a>' \
-          "${INPUT_BUILD_COMMAND:-bacon}" \
-          "${{ github.event.inputs.MAX_RETRIES }}" \
-          "${{ github.repository }}" \
-          "${{ github.run_id }}")"
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          -d "chat_id=${TELEGRAM_CHAT_ID}" \
-          -d "parse_mode=HTML" \
-          -d "disable_web_page_preview=true" \
-          --data-urlencode "text=${MSG}" || true
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        INPUT_BUILD_COMMAND: ${{ github.event.inputs.BUILD_COMMAND }}
-
     - name: Find or create project clone
       run: |
         echo "Checking for existing crave clones in /crave-devspaces/..."
@@ -291,14 +273,166 @@ jobs:
       env:
         ZDRIVE_API_KEY: ${{ secrets.ZDRIVE_API_KEY }}
 
-    # ── THE BUILD — no secrets in crave run ──
-    - name: Run build (auto-retry on crave glitches)
+    # ── Read-only: checks crave's queue, detects a resumable job from a
+    # previous cut-off run, and REQUIRES a Telegram approval before any
+    # crave run is ever submitted. No build is started by this step.
+    - name: Check crave queue & confirm before running
+      id: gate
       run: |
         set +x
         cd "$PROJECTFOLDER"
 
+        STATE_FILE="${PROJECTFOLDER}/.crave_tracked_job.json"
+        TEAM_ID="${CRAVE_TEAM_ID:-14}"
+
+        # Re-fetches cluster stats + resume-detection and (re)builds the
+        # message text. Called once up front, and again on every tap of
+        # the Refresh button — this is what makes the numbers actually
+        # live instead of a one-time snapshot.
+        fetch_and_build_msg() {
+          RESP=""
+          if [[ -n "${CRAVE_TOKEN}" ]]; then
+            RESP=$(curl -s -m 20 -X POST "https://foss.crave.io/api/job/v1/get" \
+              -H "Authorization: ${CRAVE_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"action\":\"list\",\"page\":1,\"limit\":150,\"sort\":{\"jobId\":\"desc\"},\"filter\":{\"type\":\"batch\",\"teamId\":${TEAM_ID}},\"searchKeyword\":{}}" \
+              2>/dev/null || true)
+          fi
+
+          RUNNING="?"; QUEUED="?"
+          if echo "$RESP" | jq -e '.success' &>/dev/null; then
+            RUNNING=$(echo "$RESP" | jq '[.data.content[]? | select(.status=="running")] | length' 2>/dev/null)
+            QUEUED=$(echo "$RESP" | jq '[.data.content[]? | select(.status=="queued")]  | length' 2>/dev/null)
+          fi
+
+          MODE="fresh"
+          TRACKED_JOB_ID=""
+          DETAIL_LINE="🔎 No active tracked job found — this will submit a <b>new</b> build."
+
+          if [[ -f "$STATE_FILE" ]]; then
+            OLD_JOB_ID=$(jq -r '.jobId // empty' "$STATE_FILE" 2>/dev/null)
+            if [[ -n "$OLD_JOB_ID" ]]; then
+              JOB_STATUS=""
+              if echo "$RESP" | jq -e '.success' &>/dev/null; then
+                JOB_STATUS=$(echo "$RESP" | jq -r --argjson jid "$OLD_JOB_ID" \
+                  '.data.content[]? | select(.jobId==$jid) | .status' 2>/dev/null | head -1)
+              fi
+              if [[ "$JOB_STATUS" == "queued" || "$JOB_STATUS" == "running" ]]; then
+                MODE="resume"
+                TRACKED_JOB_ID="$OLD_JOB_ID"
+                DETAIL_LINE="$(printf '🔎 Found job <b>#%s</b> from a previous run — still <b>%s</b>.\nWill attach to it instead of submitting a new build.' "$OLD_JOB_ID" "$JOB_STATUS")"
+              else
+                DETAIL_LINE="$(printf '🔎 Tracked job #%s no longer active (status: %s) — clearing, fresh build.' "$OLD_JOB_ID" "${JOB_STATUS:-unknown}")"
+                rm -f "$STATE_FILE"
+              fi
+            fi
+          fi
+
+          CHECKED_AT=$(date -u '+%H:%M:%S UTC')
+          GATE_MSG="$(printf '❓ <b>Confirm before running</b>\n\n🌐 Cluster as of %s:\n🏁 Running: %s   ⏳ Queued: %s\n\n%s\n\n<i>Tap Refresh for current numbers · nothing runs until Approve.</i>' \
+            "$CHECKED_AT" "$RUNNING" "$QUEUED" "$DETAIL_LINE")"
+        }
+
+        fetch_and_build_msg
+        echo "mode=${MODE}  tracked_job_id=${TRACKED_JOB_ID}  running=${RUNNING}  queued=${QUEUED}"
+
+        KEYBOARD='{"inline_keyboard":[[{"text":"🔄 Refresh","callback_data":"gate_refresh"}],[{"text":"✅ Approve","callback_data":"gate_approve"},{"text":"❌ Deny","callback_data":"gate_deny"}]]}'
+
+        SEND_RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          -d "chat_id=${TELEGRAM_CHAT_ID}" -d "parse_mode=HTML" \
+          -d "reply_markup=${KEYBOARD}" --data-urlencode "text=${GATE_MSG}")
+        GATE_MSG_ID=$(echo "$SEND_RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+        echo "Sent confirmation prompt, message_id=${GATE_MSG_ID}"
+
+        APPROVED=""
+        TG_OFFSET=0
+        DEADLINE=$(( $(date +%s) + 1800 ))
+
+        while [[ $(date +%s) -lt $DEADLINE ]]; do
+          UPD=$(curl -s -m 15 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" \
+            -d "offset=$((TG_OFFSET+1))" -d "timeout=20" 2>/dev/null || true)
+          LAST_ID=$(echo "$UPD" | jq -r '.result[-1].update_id // empty' 2>/dev/null)
+          [[ -n "$LAST_ID" ]] && TG_OFFSET=$LAST_ID
+
+          HIT=""
+          if [[ -n "$GATE_MSG_ID" ]]; then
+            HIT=$(echo "$UPD" | jq -c --argjson mid "$GATE_MSG_ID" \
+              '.result[]? | select(.callback_query.message.message_id==$mid) | .callback_query' 2>/dev/null | tail -1)
+          fi
+          if [[ -n "$HIT" ]]; then
+            CBID=$(echo "$HIT" | jq -r '.id')
+            DATA=$(echo "$HIT" | jq -r '.data')
+
+            if [[ "$DATA" == "gate_refresh" ]]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery" \
+                -d "callback_query_id=${CBID}" -d "text=🔄 Refreshed" > /dev/null 2>&1 || true
+              fetch_and_build_msg
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
+                -d "chat_id=${TELEGRAM_CHAT_ID}" -d "message_id=${GATE_MSG_ID}" \
+                -d "parse_mode=HTML" -d "reply_markup=${KEYBOARD}" \
+                --data-urlencode "text=${GATE_MSG}" > /dev/null 2>&1 || true
+              DEADLINE=$(( $(date +%s) + 1800 ))
+              continue
+            fi
+
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery" \
+              -d "callback_query_id=${CBID}" -d "text=Got it" > /dev/null 2>&1 || true
+            [[ "$DATA" == "gate_approve" ]] && APPROVED="1" || APPROVED="0"
+            break
+          fi
+          sleep 3
+        done
+
+        [[ -n "$GATE_MSG_ID" ]] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup" \
+          -d "chat_id=${TELEGRAM_CHAT_ID}" -d "message_id=${GATE_MSG_ID}" \
+          -d 'reply_markup={"inline_keyboard":[]}' > /dev/null 2>&1 || true
+
+        if [[ "$APPROVED" == "1" ]]; then
+          echo "approved=true" >> "$GITHUB_OUTPUT"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "job_id=${TRACKED_JOB_ID}" >> "$GITHUB_OUTPUT"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" -d "parse_mode=HTML" \
+            --data-urlencode "text=✅ Approved (${MODE}) — proceeding." > /dev/null 2>&1 || true
+        else
+          echo "approved=false" >> "$GITHUB_OUTPUT"
+          REASON="denied"
+          [[ -z "$APPROVED" ]] && REASON="timed out after 30 min with no response"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" -d "parse_mode=HTML" \
+            --data-urlencode "text=🚫 Not approved (${REASON}) — no build was started." > /dev/null 2>&1 || true
+        fi
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
+        CRAVE_TEAM_ID: ${{ secrets.CRAVE_TEAM_ID }}
+
+    # ── THE BUILD — no secrets in crave run ──
+    - name: Run build
+      if: steps.gate.outputs.approved == 'true'
+      run: |
+        set +x
+        cd "$PROJECTFOLDER"
+
+        GATE_MODE="${{ steps.gate.outputs.mode }}"
+        GATE_JOB_ID="${{ steps.gate.outputs.job_id }}"
+
+        if [[ "$GATE_MODE" == "resume" ]]; then
+          echo "Resume mode requested for job #${GATE_JOB_ID}."
+          echo "NOT YET IMPLEMENTED: attaching to and pulling an already-running"
+          echo "job (rather than one this run started) needs crave's actual pull"
+          echo "semantics confirmed first, to avoid risking a wrong/stale artifact."
+          MSG="$(printf '⚠️ <b>Resume not wired up yet</b>\n\nJob #%s is still active, but this workflow does not yet know how to safely attach to and pull a job it did not start itself. Nothing was pulled or uploaded. Ask for this to be built once the detection above looks right.' "$GATE_JOB_ID")"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" -d "parse_mode=HTML" \
+            --data-urlencode "text=${MSG}" > /dev/null 2>&1 || true
+          exit 0
+        fi
+
         BUILD_COMMAND="${INPUT_BUILD_COMMAND}"
         LOG_FILE="/tmp/crave_build_output.log"
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
         PAID_FLAG=""
         if [[ -n "${{ secrets.PAID }}" ]]; then
@@ -308,14 +442,33 @@ jobs:
         MAX_RETRIES=${{ github.event.inputs.MAX_RETRIES }}
         RETRY_DELAY=30
 
-        # Telegram helper — builds message in variable first, safe for YAML
-        tg_send() {
-          local msg="$1"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            -d "parse_mode=HTML" \
-            -d "disable_web_page_preview=true" \
-            --data-urlencode "text=${msg}" > /dev/null 2>&1 || true
+        # crave's stdout is block-buffered (not line-buffered) once it's
+        # piped instead of going to a real terminal — without this, nothing
+        # shows up in this log OR in LOG_FILE (so monitor.sh sees nothing
+        # either) until crave's internal buffer fills or the process exits.
+        STDBUF_PREFIX=""
+        if command -v stdbuf &> /dev/null; then
+          STDBUF_PREFIX="stdbuf -oL -eL"
+        fi
+
+        # STEP_PID is stable across every attempt in this loop — it's what
+        # lets monitor.sh persist ONE Telegram message across retries, and
+        # what the Stop button's "auto-retry once" flag is keyed on.
+        STEP_PID=$$
+        MSG_STATE_FILE="/tmp/volt_msg_state_${STEP_PID}.txt"
+        STOP_SENTINEL="/tmp/volt_stop_requested_${STEP_PID}"
+        STOP_RETRY_USED_FILE="/tmp/volt_stop_retry_used_${STEP_PID}"
+        rm -f "$MSG_STATE_FILE" "$STOP_SENTINEL" "$STOP_RETRY_USED_FILE"
+
+        # monitor.sh self-exits as soon as it's published a terminal/handoff
+        # state — wait briefly for that instead of killing it mid-edit.
+        wait_for_monitor() {
+          local pid="$1" tries="${2:-8}"
+          for i in $(seq 1 "$tries"); do
+            kill -0 "$pid" 2>/dev/null || return 0
+            sleep 2
+          done
+          return 1
         }
 
         for attempt in $(seq 1 "$MAX_RETRIES"); do
@@ -327,11 +480,13 @@ jobs:
           rm -f "$LOG_FILE"
           touch "$LOG_FILE"
 
-          # Download and start background Telegram monitor
+          # Download and start background Telegram monitor — it owns the
+          # ONE Telegram message for the whole workflow run, continuing
+          # across every retry attempt via MSG_STATE_FILE.
           MONITOR_SCRIPT="/tmp/volt_monitor_$$.sh"
           curl -LSs "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/monitor.sh" -o "$MONITOR_SCRIPT"
           chmod +x "$MONITOR_SCRIPT"
-          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$$" "$PROJECTFOLDER" &
+          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$STEP_PID" "$PROJECTFOLDER" "$attempt" "$MAX_RETRIES" "$BUILD_COMMAND" "$RUN_URL" &
           MONITOR_PID=$!
           echo "Monitor started (PID: $MONITOR_PID)"
 
@@ -343,18 +498,51 @@ jobs:
           fi
 
           # Run the build — NO SECRETS in this command
-          set +e
-          crave ${{ secrets.CRAVE_FLAGS }} run --no-patch ${PAID_FLAG} -- \
-            "$VOLT_CMD" \
-            2>&1 | tee "$LOG_FILE"
-          EXIT_CODE=${PIPESTATUS[0]}
-          set -e
+          #
+          # stdbuf alone (previous attempt) only intercepts libc-buffered
+          # I/O — if crave manages its own output (common for Go/Rust CLIs)
+          # or checks isatty() to decide whether to stream live progress at
+          # all, stdbuf has no effect. A pseudo-terminal via `script` fixes
+          # both cases at once, since crave then genuinely believes it's
+          # talking to a real terminal.
+          CRAVE_WRAPPER="/tmp/crave_invoke_$$.sh"
+          CRAVE_EXIT_FILE="/tmp/crave_exit_$$.txt"
+          rm -f "$CRAVE_EXIT_FILE"
+          printf '#!/bin/bash\n%s crave %s run --no-patch %s -- "%s"\necho $? > "%s"\n' \
+            "$STDBUF_PREFIX" "${{ secrets.CRAVE_FLAGS }}" "$PAID_FLAG" "$VOLT_CMD" "$CRAVE_EXIT_FILE" \
+            > "$CRAVE_WRAPPER"
+          chmod +x "$CRAVE_WRAPPER"
 
-          kill "$MONITOR_PID" 2>/dev/null || true
-          wait "$MONITOR_PID" 2>/dev/null || true
+          set +e
+          if command -v script &> /dev/null; then
+            script -qc "bash '$CRAVE_WRAPPER'" /dev/null 2>&1 | tee "$LOG_FILE"
+          else
+            bash "$CRAVE_WRAPPER" 2>&1 | tee "$LOG_FILE"
+          fi
+          set -e
+          EXIT_CODE=$(cat "$CRAVE_EXIT_FILE" 2>/dev/null || echo 1)
+          rm -f "$CRAVE_WRAPPER" "$CRAVE_EXIT_FILE"
 
           FULL_OUTPUT_LINES=$(wc -l < "$LOG_FILE" 2>/dev/null || echo "0")
           TAIL_OUTPUT=$(tail -30 "$LOG_FILE" 2>/dev/null || true)
+
+          # ── MANUAL STOP (Telegram button, confirmed) — auto-retry once ──
+          if [[ -f "$STOP_SENTINEL" ]]; then
+            rm -f "$STOP_SENTINEL"
+            wait_for_monitor "$MONITOR_PID" 6
+            kill "$MONITOR_PID" 2>/dev/null || true
+            wait "$MONITOR_PID" 2>/dev/null || true
+            if [[ ! -f "$STOP_RETRY_USED_FILE" && $attempt -lt $MAX_RETRIES ]]; then
+              touch "$STOP_RETRY_USED_FILE"
+              echo "Manual stop via Telegram — auto-retrying once (attempt ${attempt}/${MAX_RETRIES})"
+              sleep "$RETRY_DELAY"
+              continue
+            else
+              echo "Manual stop via Telegram — not retrying again"
+              rm -f "$MSG_STATE_FILE" "$STOP_RETRY_USED_FILE"
+              exit 1
+            fi
+          fi
 
           # ── SUCCESS ──
           if [[ $EXIT_CODE -eq 0 ]]; then
@@ -368,28 +556,34 @@ jobs:
             if [[ -n "$PULLED_ZIP" && -f "$PULLED_ZIP" ]]; then
               FILENAME=$(basename "$PULLED_ZIP")
               echo "Pulled: $FILENAME"
+              echo "[VOLT_UPLOADING] ${FILENAME}" >> "$LOG_FILE"
 
               echo "Uploading to zdrive..."
-              UPLOAD_LOG=$(zdrive "$PULLED_ZIP" 2>&1)
-              DOWNLOAD_LINK=$(echo "$UPLOAD_LOG" | grep -o 'https://zdrive.to/[a-zA-Z0-9_-]*')
+              UPLOAD_TMP="/tmp/zdrive_upload_$$.log"
+              # Stream zdrive's own output into LOG_FILE too, live — so
+              # monitor.sh shows real upload progress instead of going
+              # silent until the whole upload finishes.
+              zdrive "$PULLED_ZIP" 2>&1 | tee "$UPLOAD_TMP" | tee -a "$LOG_FILE" > /dev/null
+              DOWNLOAD_LINK=$(grep -o 'https://zdrive.to/[a-zA-Z0-9_-]*' "$UPLOAD_TMP" | tail -1)
 
               if [[ -n "$DOWNLOAD_LINK" ]]; then
                 echo "Upload complete: $DOWNLOAD_LINK"
-                MSG="$(printf '📦 <b>Build Complete!</b>\n\nFile: %s\nDownload: <a href="%s">%s</a>\n\nCommand: <code>%s</code>' \
-                  "$FILENAME" "$DOWNLOAD_LINK" "$DOWNLOAD_LINK" "$BUILD_COMMAND")"
+                echo "[VOLT_UPLOAD_OK] ${FILENAME}|${DOWNLOAD_LINK}" >> "$LOG_FILE"
               else
-                echo "zdrive upload failed: $UPLOAD_LOG"
-                MSG="$(printf '⚠️ <b>Build OK but zdrive upload failed!</b>\n\nFile: %s\nCommand: <code>%s</code>\n\nCheck Actions logs for details.' \
-                  "$FILENAME" "$BUILD_COMMAND")"
+                echo "zdrive upload failed: $(cat "$UPLOAD_TMP")"
+                echo "[VOLT_UPLOAD_FAIL] ${FILENAME}" >> "$LOG_FILE"
               fi
-              tg_send "$MSG"
-              rm -f "$PULLED_ZIP"
+              rm -f "$UPLOAD_TMP" "$PULLED_ZIP"
             else
               echo "No zip found after crave pull"
-              MSG="$(printf '⚠️ <b>Build succeeded but no ROM zip found!</b>\n\nCommand: <code>%s</code>' "$BUILD_COMMAND")"
-              tg_send "$MSG"
+              echo "[VOLT_NO_ZIP]" >> "$LOG_FILE"
             fi
 
+            # Give monitor.sh time to see the tag and finalize the message
+            wait_for_monitor "$MONITOR_PID" 10
+            kill "$MONITOR_PID" 2>/dev/null || true
+            wait "$MONITOR_PID" 2>/dev/null || true
+            rm -f "$MSG_STATE_FILE" "$STOP_RETRY_USED_FILE"
             exit 0
           fi
 
@@ -414,37 +608,61 @@ jobs:
 
             if [[ $attempt -lt $MAX_RETRIES ]]; then
               echo "  Retrying in ${RETRY_DELAY}s..."
-              SNIPPET="${TAIL_OUTPUT:-(empty output)}"
-              MSG="$(printf '🔄 <b>Crave glitch — build never started</b>\nAttempt %s/%s, retrying in %ss\n\n<code>%s</code>' \
-                "$attempt" "$MAX_RETRIES" "$RETRY_DELAY" "${SNIPPET:0:500}")"
-              tg_send "$MSG"
+              echo "[VOLT_GLITCH_RETRY] ${RETRY_DELAY}" >> "$LOG_FILE"
+              wait_for_monitor "$MONITOR_PID" 6
+              kill "$MONITOR_PID" 2>/dev/null || true
+              wait "$MONITOR_PID" 2>/dev/null || true
               sleep "$RETRY_DELAY"
               continue
             else
               echo "  All ${MAX_RETRIES} glitch retries exhausted"
-              SNIPPET="${TAIL_OUTPUT:-(empty output)}"
-              MSG="$(printf '❌ <b>All %s crave retries failed — never got a worker</b>\n\n<code>%s</code>' \
-                "$MAX_RETRIES" "${SNIPPET:0:500}")"
-              tg_send "$MSG"
+              echo "[VOLT_GLITCH_EXHAUSTED]" >> "$LOG_FILE"
+              wait_for_monitor "$MONITOR_PID" 8
+              kill "$MONITOR_PID" 2>/dev/null || true
+              wait "$MONITOR_PID" 2>/dev/null || true
+              rm -f "$MSG_STATE_FILE" "$STOP_RETRY_USED_FILE"
               exit 1
             fi
           fi
 
-          # ── REAL BUILD FAILURE — send log, no retry ──
+          # ── REAL BUILD FAILURE — monitor.sh sends the full log as a file ──
           echo "Real build failure (exit: ${EXIT_CODE}) — not retrying"
-          LAST_LINES=$(tail -30 "$LOG_FILE" 2>/dev/null || echo "No log available")
-          MSG="$(printf '❌ <b>Build Failed</b>\n\nExit Code: %s\nCommand: <code>%s</code>\n\n<b>Last lines:</b>\n<pre>%s</pre>' \
-            "$EXIT_CODE" "$BUILD_COMMAND" "${LAST_LINES:0:2500}")"
-          tg_send "$MSG"
+          echo "[VOLT_REAL_FAIL] ${EXIT_CODE}" >> "$LOG_FILE"
+          wait_for_monitor "$MONITOR_PID" 8
+          kill "$MONITOR_PID" 2>/dev/null || true
+          wait "$MONITOR_PID" 2>/dev/null || true
+          rm -f "$MSG_STATE_FILE" "$STOP_RETRY_USED_FILE"
           exit $EXIT_CODE
         done
-      timeout-minutes: 720
+      timeout-minutes: 1440
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         ZDRIVE_API_KEY: ${{ secrets.ZDRIVE_API_KEY }}
         INPUT_BUILD_COMMAND: ${{ github.event.inputs.BUILD_COMMAND }}
+        # Used by monitor.sh for live cluster queue position/running/queued stats.
+        # Optional: monitor.sh disables that feature silently if CRAVE_TOKEN is unset.
+        CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
+        CRAVE_TEAM_ID: ${{ secrets.CRAVE_TEAM_ID }}
 
     - name: Stop crave on cancel
       if: ${{ cancelled() }}
-      run: cd "$PROJECTFOLDER" && crave stop --all
+      run: |
+        cd "$PROJECTFOLDER" && crave stop --all
+
+        # This is a workflow-level cancellation from the GitHub UI, not the
+        # Telegram Stop button — monitor.sh is already gone by this point,
+        # so this is a simple best-effort notice, not the unified message.
+        # NOTE: auto-restart isn't wired up for this path — it would need a
+        # workflow_dispatch re-trigger via the GitHub API. Ask if you want
+        # that added.
+        MSG="$(printf '🛑 <b>Workflow Cancelled</b>\n\nCancelled from GitHub Actions — crave job stopped.\nCommand: <code>%s</code>' \
+          "${INPUT_BUILD_COMMAND:-bacon}")"
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          -d "chat_id=${TELEGRAM_CHAT_ID}" \
+          -d "parse_mode=HTML" \
+          --data-urlencode "text=${MSG}" > /dev/null 2>&1 || true
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        INPUT_BUILD_COMMAND: ${{ github.event.inputs.BUILD_COMMAND }}
