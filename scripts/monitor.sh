@@ -86,6 +86,9 @@ MSG_STATE_FILE="/tmp/volt_msg_state_${STEP_PID}.txt"
 STOP_SENTINEL="/tmp/volt_stop_requested_${STEP_PID}"
 STOP_RETRY_USED_FILE="/tmp/volt_stop_retry_used_${STEP_PID}"
 
+MONITOR_LOG="/tmp/monitor_debug_$$.log"
+dbg() { echo "[$(date '+%H:%M:%S')] $*" >> "$MONITOR_LOG"; }
+
 MSG_ID=""
 [[ -f "$MSG_STATE_FILE" ]] && MSG_ID=$(cat "$MSG_STATE_FILE" 2>/dev/null || true)
 
@@ -150,8 +153,6 @@ TG_OFFSET=$TG_OFFSET_INIT
 LAST_LINE_COUNT=0
 TEMP_FILE="/tmp/monitor_lines_$$.tmp"
 
-MONITOR_LOG="/tmp/monitor_debug_$$.log"
-dbg() { echo "[$(date '+%H:%M:%S')] $*" >> "$MONITOR_LOG"; }
 
 # Call on any real terminal outcome reached within THIS run (success,
 # real failure, glitch-exhausted, confirmed stop) — nothing left to resume.
@@ -634,7 +635,7 @@ handle_command() {
         list|/list)
             dbg "List builds requested"
             if [[ -z "$CRAVE_TOKEN" ]]; then
-                tg_send "⚠️ CRAVE_TOKEN not set — can't fetch the job list." ""
+                tg_send "⚠️ CRAVE_TOKEN not set — can't fetch the job list." "" >/dev/null
                 return
             fi
             local resp
@@ -644,7 +645,7 @@ handle_command() {
                 -d "{\"action\":\"list\",\"page\":1,\"limit\":150,\"sort\":{\"jobId\":\"desc\"},\"filter\":{\"type\":\"batch\",\"teamId\":${CRAVE_TEAM_ID}},\"searchKeyword\":{}}" \
                 2>/dev/null)
             if ! echo "$resp" | jq -e '.success' >/dev/null 2>&1; then
-                tg_send "⚠️ Couldn't fetch the job list right now — crave API didn't return a usable response." ""
+                tg_send "⚠️ Couldn't fetch the job list right now — crave API didn't return a usable response." "" >/dev/null
                 return
             fi
 
@@ -684,7 +685,7 @@ handle_command() {
                 out="${out}"$'\n'"<i>No job ID captured yet for this build — can't cross-check position.</i>"
             fi
 
-            tg_send "$out" ""
+            tg_send "$out" "" >/dev/null
             ;;
         reload|/reload)
             dbg "Reload requested — re-fetching latest monitor.sh"
@@ -694,14 +695,14 @@ handle_command() {
                 dbg "Reload: got fresh copy, exec'ing (same PID, same message thread)"
                 # Clear MSG_ID state so the reloaded script validates & recreates if deleted
                 rm -f "$MSG_STATE_FILE" 2>/dev/null || true
-                tg_send "🔁 Reloading — picking up the latest script now..." ""
+                tg_send "🔁 Reloading — picking up the latest script now..." "" >/dev/null
                 exec bash "$new_script" "$LOG_FILE" "$STEP_PID" "$PROJECT_DIR" "$ATTEMPT" "$MAX_RETRIES" "$BUILD_COMMAND" "$RUN_URL" "$TG_OFFSET"
                 # exec only returns on failure
                 dbg "Reload: exec failed unexpectedly, staying on current version"
-                tg_send "⚠️ Reload failed to start — still running the previous version." ""
+                tg_send "⚠️ Reload failed to start — still running the previous version." "" >/dev/null
             else
                 dbg "Reload: download failed"
-                tg_send "⚠️ Reload failed — couldn't download the latest script. Still running the previous version." ""
+                tg_send "⚠️ Reload failed — couldn't download the latest script. Still running the previous version." "" >/dev/null
             fi
             ;;
     esac
