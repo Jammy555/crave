@@ -106,8 +106,14 @@ if [[ -n "$MSG_ID" ]]; then
     fi
 fi
 
-START_EPOCH=$(date +%s)
-START_FMT=$(date '+%Y-%m-%d %H:%M:%S UTC' -u)
+START_EPOCH_FILE="/tmp/volt_start_epoch_${STEP_PID}.txt"
+if [[ -f "$START_EPOCH_FILE" ]]; then
+    START_EPOCH=$(cat "$START_EPOCH_FILE" 2>/dev/null || date +%s)
+else
+    START_EPOCH=$(date +%s)
+    echo "$START_EPOCH" > "$START_EPOCH_FILE" 2>/dev/null || true
+fi
+START_FMT=$(date -d "@$START_EPOCH" '+%Y-%m-%d %H:%M:%S UTC' -u 2>/dev/null || date '+%Y-%m-%d %H:%M:%S UTC' -u)
 
 if [[ "$ATTEMPT" -gt 1 ]]; then
     PHASE="retrying"
