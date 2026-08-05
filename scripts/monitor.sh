@@ -202,14 +202,29 @@ tg_edit() {
                  --data-urlencode "text=${text}" )
     [[ -n "$markup" ]] && args+=( -d "reply_markup=${markup}" )
     local resp; resp=$(_curl_tg "editMessageText" "${args[@]}")
-    if echo "$resp" | grep -q '"error_code"'; then
-        local desc; desc=$(echo "$resp" | grep -o '"description":"[^"]*"')
-        dbg "tg_edit FAIL: $desc"
-        if echo "$desc" | grep -qiE "message to edit not found|message can.t be edited|MESSAGE_ID_INVALID|chat not found"; then
-            return 1
-        fi
+
+    # Empty response = network failure → treat as gone so we recreate
+    if [[ -z "$resp" ]]; then
+        dbg "tg_edit FAIL: empty response (network error?)"
+        return 1
     fi
-    return 0
+
+    # Check for success first
+    if echo "$resp" | grep -q '"ok":true'; then
+        return 0
+    fi
+
+    # Any error → check if it's a "message not modified" (harmless) vs message gone
+    local desc; desc=$(echo "$resp" | grep -o '"description":"[^"]*"' | head -1)
+    dbg "tg_edit FAIL: $desc"
+
+    # "message is not modified" = content identical, message still exists → OK
+    if echo "$desc" | grep -qi "message is not modified"; then
+        return 0
+    fi
+
+    # Everything else (message deleted, invalid ID, chat gone, etc.) → recreate
+    return 1
 }
 
 tg_edit_markup() {
