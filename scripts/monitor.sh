@@ -89,6 +89,20 @@ STOP_RETRY_USED_FILE="/tmp/volt_stop_retry_used_${STEP_PID}"
 MSG_ID=""
 [[ -f "$MSG_STATE_FILE" ]] && MSG_ID=$(cat "$MSG_STATE_FILE" 2>/dev/null || true)
 
+# Validate saved MSG_ID is still alive (user might have deleted the pinned msg)
+if [[ -n "$MSG_ID" ]]; then
+    _validate_resp=$(_curl_tg "editMessageText" \
+        -d "chat_id=${TELEGRAM_CHAT}" -d "message_id=${MSG_ID}" \
+        -d "parse_mode=HTML" --data-urlencode "text=⏳ Reconnecting..." 2>/dev/null)
+    if echo "$_validate_resp" | grep -q '"error_code"'; then
+        dbg "Saved MSG_ID=$MSG_ID is no longer valid (deleted?) — will create a fresh message"
+        MSG_ID=""
+        rm -f "$MSG_STATE_FILE" 2>/dev/null || true
+    else
+        dbg "Saved MSG_ID=$MSG_ID validated OK"
+    fi
+fi
+
 START_EPOCH=$(date +%s)
 START_FMT=$(date '+%Y-%m-%d %H:%M:%S UTC' -u)
 
@@ -663,6 +677,8 @@ handle_command() {
             if curl -LSs "$MONITOR_SELF_URL" -o "$new_script" 2>/dev/null && [[ -s "$new_script" ]]; then
                 chmod +x "$new_script"
                 dbg "Reload: got fresh copy, exec'ing (same PID, same message thread)"
+                # Clear MSG_ID state so the reloaded script validates & recreates if deleted
+                rm -f "$MSG_STATE_FILE" 2>/dev/null || true
                 tg_send "🔁 Reloading — picking up the latest script now..." ""
                 exec bash "$new_script" "$LOG_FILE" "$STEP_PID" "$PROJECT_DIR" "$ATTEMPT" "$MAX_RETRIES" "$BUILD_COMMAND" "$RUN_URL" "$TG_OFFSET"
                 # exec only returns on failure
