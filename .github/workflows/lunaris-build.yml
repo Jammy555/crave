@@ -601,6 +601,10 @@ jobs:
           if [[ "$FULL_OUTPUT_LINES" -eq 0 || -z "$TAIL_OUTPUT" ]]; then
             IS_CRAVE_GLITCH=1
           fi
+          # Queue timeout or container died before build script ran
+          if ! grep -qF "[VOLT_START]" "$LOG_FILE" 2>/dev/null; then
+            IS_CRAVE_GLITCH=1
+          fi
 
           if [[ $IS_CRAVE_GLITCH -eq 1 ]]; then
             echo "Crave glitch (no real build started) — attempt ${attempt}/${MAX_RETRIES}"
