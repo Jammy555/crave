@@ -36,6 +36,12 @@ on:
         default: '2'
         type: string
 
+      AUTO_APPROVE:
+        description: 'Auto-approve build gate (proceed directly without waiting for Telegram confirmation)'
+        required: false
+        default: 'true'
+        type: boolean
+
       RUNNER_TOKEN:
         description: 'Optional runner token (only needed for first-time runner setup)'
         required: false
@@ -49,7 +55,7 @@ jobs:
   runner-setup:
     name: "🔧 Runner Check & Auto-Start"
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 15
     steps:
     - name: Configure crave CLI
       run: |
@@ -104,9 +110,10 @@ jobs:
         # Even if crave switches machines (foss→fedora→etc), this always:
         #   a) re-registers the runner on the NEW machine (config.sh --replace)
         #   b) starts run.sh with nohup so it survives SSH disconnect
+        #   c) starts a keepalive loop to prevent Crave's idle reaper from killing the devspace
         # No manual nohup needed ever again.
         status=0
-        timeout 90s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
+        timeout 300s crave ${{ secrets.CRAVE_FLAGS }} devspace -- "
           set -e
           RUNNER_DIR=\$HOME/actions-runner
           RUNNER_LOG=/tmp/runner.log
@@ -126,6 +133,12 @@ jobs:
             disown \$pid
             echo \$pid > \"\$RUNNER_PID_FILE\"
             echo \"Runner started — PID \$pid\"
+
+            # Keepalive daemon: prevents Crave idle reaper from terminating devspace
+            pkill -f 'crave_keepalive' 2>/dev/null || true
+            nohup bash -c 'while true; do touch /tmp/crave_keepalive.tick; sleep 60; done' >/dev/null 2>&1 &
+            echo \"Devspace keepalive started\"
+
             # Wait locally up to 20s for Runner.Listener to appear
             for i in \$(seq 1 20); do
               sleep 1
@@ -336,6 +349,19 @@ jobs:
         fetch_and_build_msg
         echo "mode=${MODE}  tracked_job_id=${TRACKED_JOB_ID}  running=${RUNNING}  queued=${QUEUED}"
 
+        # If AUTO_APPROVE is enabled, skip waiting for manual Telegram approval
+        AUTO_APPROVE_VAL="${{ github.event.inputs.AUTO_APPROVE }}"
+        if [[ "$AUTO_APPROVE_VAL" == "true" ]]; then
+          echo "Auto-approve enabled — proceeding with build directly."
+          echo "approved=true" >> "$GITHUB_OUTPUT"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "job_id=${TRACKED_JOB_ID}" >> "$GITHUB_OUTPUT"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" -d "parse_mode=HTML" \
+            --data-urlencode "text=🚀 <b>Build auto-approved</b> (${MODE}) — proceeding." > /dev/null 2>&1 || true
+          exit 0
+        fi
+
         KEYBOARD='{"inline_keyboard":[[{"text":"🔄 Refresh","callback_data":"gate_refresh"}],[{"text":"✅ Approve","callback_data":"gate_approve"},{"text":"❌ Deny","callback_data":"gate_deny"}]]}'
 
         SEND_RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -346,7 +372,8 @@ jobs:
 
         APPROVED=""
         TG_OFFSET=0
-        DEADLINE=$(( $(date +%s) + 1800 ))
+        # 12-hour deadline to match Crave devspace session (no arbitrary premature expiration)
+        DEADLINE=$(( $(date +%s) + 43200 ))
 
         while [[ $(date +%s) -lt $DEADLINE ]]; do
           UPD=$(curl -s -m 15 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" \
@@ -371,7 +398,7 @@ jobs:
                 -d "chat_id=${TELEGRAM_CHAT_ID}" -d "message_id=${GATE_MSG_ID}" \
                 -d "parse_mode=HTML" -d "reply_markup=${KEYBOARD}" \
                 --data-urlencode "text=${GATE_MSG}" > /dev/null 2>&1 || true
-              DEADLINE=$(( $(date +%s) + 1800 ))
+              DEADLINE=$(( $(date +%s) + 43200 ))
               continue
             fi
 
@@ -397,7 +424,7 @@ jobs:
         else
           echo "approved=false" >> "$GITHUB_OUTPUT"
           REASON="denied"
-          [[ -z "$APPROVED" ]] && REASON="timed out after 30 min with no response"
+          [[ -z "$APPROVED" ]] && REASON="timed out after 12h with no response"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" -d "parse_mode=HTML" \
             --data-urlencode "text=🚫 Not approved (${REASON}) — no build was started." > /dev/null 2>&1 || true
@@ -552,6 +579,14 @@ jobs:
             crave ${{ secrets.CRAVE_FLAGS }} pull "out/target/product/lemonade/Lunaris-AOSP-lemonade*.zip" 2>&1 || true
 
             PULLED_ZIP=$(find . -maxdepth 1 -name "Lunaris-AOSP-lemonade*.zip" -type f 2>/dev/null | head -1)
+
+            # Fallback: pull with explicit job ID if direct pull didn't find zip
+            CURRENT_JOB_ID=$(jq -r '.jobId // empty' "${PROJECTFOLDER}/.crave_tracked_job.json" 2>/dev/null || true)
+            if [[ -z "$PULLED_ZIP" && -n "$CURRENT_JOB_ID" ]]; then
+              echo "Direct pull yielded no zip, trying explicit pull with --job ${CURRENT_JOB_ID}..."
+              crave ${{ secrets.CRAVE_FLAGS }} pull --job "$CURRENT_JOB_ID" "out/target/product/lemonade/Lunaris-AOSP-lemonade*.zip" 2>&1 || true
+              PULLED_ZIP=$(find . -maxdepth 1 -name "Lunaris-AOSP-lemonade*.zip" -type f 2>/dev/null | head -1)
+            fi
 
             if [[ -n "$PULLED_ZIP" && -f "$PULLED_ZIP" ]]; then
               FILENAME=$(basename "$PULLED_ZIP")
