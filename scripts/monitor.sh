@@ -74,11 +74,11 @@ CRAVE_API="https://foss.crave.io/api/job/v1/get"
 MONITOR_SELF_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY:-}/refs/heads/${GITHUB_REF_NAME:-main}/scripts/monitor.sh"
 
 # ─── Timing ─────────────────────────────────────────────────────────────
-QUEUE_INTERVAL=120     # fallback full-refresh cadence while queuing (2 min)
+QUEUE_INTERVAL=1800    # fallback full-refresh cadence while queuing (30 min)
 PROGRESS_INTERVAL=60   # edit cadence while building
 STATS_INTERVAL=30      # container-stats refresh cadence
 POLL_INTERVAL=5        # log file poll rate
-QSTATS_INTERVAL=180    # cluster-queue API poll rate (3 min heartbeat — Refresh button bypasses this)
+QSTATS_INTERVAL=1800   # cluster-queue API poll rate (30 min heartbeat — Refresh button bypasses this)
 INIT_RETRY_INTERVAL=15 # backoff between retries if the very first send fails (e.g. TG unreachable)
 
 # ─── Cross-attempt state (keyed by the retry loop's stable PID) ───────────
@@ -453,7 +453,7 @@ Automatically retrying this build once..."
     local phase_hint=""
     if [[ "$PHASE" == "queuing" ]]; then
         phase_hint="
-<i>Position updates live · full refresh ~3 min</i>"
+<i>Position updates live · full refresh ~30 min</i>"
     fi
 
     printf '%s <b>LunarisOS — %s</b>\n\n%s\n%s\n━━━━━━━━━━━━━━━━━━━━━━━━\n👉 <b>%s</b>\n%s%s%s%s%s' \
