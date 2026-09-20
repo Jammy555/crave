@@ -44,6 +44,7 @@ DEVICE_CODE="lemonade"
 DEVICE_CONFIG_FILE=""
 DEVICE_BASE_URL="${DEVICE_BASE_URL:-https://raw.githubusercontent.com/${GITHUB_REPOSITORY:-Jammy555/crave}/refs/heads/${GITHUB_REF_NAME:-main}}"
 LUNCH_TARGET=""
+BUILD_VARIANT=""
 BUILD_TARGET="Lunaris"
 ANDROID_VERSION="16"
 MANIFEST_URL="https://github.com/Lunaris-AOSP/android.git"
@@ -150,6 +151,7 @@ FLAGS
   --device-config=<path|url>    Path or URL to a custom device script.
   --device-base-url=<url>       Base URL for remote device scripts.
   --lunch=<target>              Override lunch target (e.g. lineage_capri-bp4a-userdebug).
+  --variant=<variant>           Build variant: userdebug, user, or eng (default: userdebug).
   --nosync                      Skip syncing + cloning, rebuild from disk.
   --nosyncd                     Skip device tree cloning only.
   --reset[=<paths>]             Hard reset (git reset --hard && clean -fd).
@@ -168,7 +170,7 @@ MODULES — max 2 per run
   SAME module. A word starting with "-" starts a SECOND module.
   No module given → defaults to "bacon" (the full flashable zip).
 
-  Example:  ...volt.sh | bash -s -- --device=capri bacon
+  Example:  ...volt.sh | bash -s -- --device=capri --variant=user bacon
   Example:  ...volt.sh | bash -s -- --device=lemonade --tree1=kernel:test KeyHandler -bacon
 USAGE_EOF
 }
@@ -193,6 +195,8 @@ for arg in "$@"; do
             DEVICE_BASE_URL="${arg#*=}" ;;
         --lunch=*)
             LUNCH_TARGET="${arg#*=}" ;;
+        --variant=*)
+            BUILD_VARIANT="${arg#*=}" ;;
     esac
 done
 
@@ -207,12 +211,19 @@ if [[ -z "$LUNCH_TARGET" ]]; then
     LUNCH_TARGET="lineage_${DEVICE_CODE}-bp4a-userdebug"
 fi
 
+# If a build variant was explicitly requested (e.g. user, userdebug, eng), adjust LUNCH_TARGET
+if [[ -n "$BUILD_VARIANT" ]]; then
+    if [[ "$LUNCH_TARGET" =~ -(userdebug|user|eng)$ ]]; then
+        LUNCH_TARGET="${LUNCH_TARGET%-*}-${BUILD_VARIANT}"
+    fi
+fi
+
 # --- Pass 2: Parse remaining flags and modules ---
 for arg in "$@"; do
     case "$arg" in
         -h|--help)
             print_usage; exit 0 ;;
-        --device=*|--device-config=*|--device-base-url=*|--lunch=*)
+        --device=*|--device-config=*|--device-base-url=*|--lunch=*|--variant=*)
             # Handled in Pass 1
             ;;
         --nosync)
@@ -532,6 +543,63 @@ print(max(0,min(100,int(((dt-di)/dt)*100))) if dt>0 else 0)" 2>/dev/null || echo
 start_build_process() {
     clean_stale_locks
     mkdir -p out
+
+    # --- DEVICE SWITCH DETECTION & STALE TREE CLEANUP ---
+    local last_device_file=".repo/.volt_last_device"
+    local last_trees_file=".repo/.volt_last_device_trees"
+
+    # Extract normalized target directory paths for current device
+    local current_device_paths=()
+    for lookup in "${TREE_LOOKUP[@]}"; do
+        local rest="${lookup#*|}"
+        local tdir="${rest%%|*}"
+        tdir="${tdir#./}"
+        current_device_paths+=("$tdir")
+    done
+
+    if [[ -f "$last_device_file" ]]; then
+        local last_device; last_device=$(cat "$last_device_file" 2>/dev/null || true)
+        if [[ -n "$last_device" && "$last_device" != "$DEVICE_CODE" ]]; then
+            log_status "Device Switch 🔄" "Detected switch from ${last_device} to ${DEVICE_CODE}. Cleaning stale trees..."
+            step_start
+
+            # Remove previous device trees that are not used by the new device
+            if [[ -f "$last_trees_file" ]]; then
+                while IFS= read -r old_path; do
+                    [[ -z "$old_path" ]] && continue
+                    old_path="${old_path#./}"
+                    local keep=0
+                    for cpath in "${current_device_paths[@]}"; do
+                        if [[ "$old_path" == "$cpath" ]]; then
+                            keep=1
+                            break
+                        fi
+                    done
+                    if [[ $keep -eq 0 && -d "$old_path" ]]; then
+                        echo "  [Device Switch] Removing stale tree: $old_path"
+                        rm -rf "$old_path"
+                        # Clean up empty parent directories if any
+                        local parent_dir; parent_dir=$(dirname "$old_path")
+                        while [[ "$parent_dir" != "." && "$parent_dir" != "/" ]]; do
+                            rmdir "$parent_dir" 2>/dev/null || break
+                            parent_dir=$(dirname "$parent_dir")
+                        done
+                    fi
+                done < "$last_trees_file"
+            fi
+
+            # Clean stale build outputs across device switches to avoid ninja cache poisoning
+            echo "  [Device Switch] Cleaning stale build outputs (out/target/product out/soong)..."
+            rm -rf out/target/product out/soong 2>/dev/null || true
+
+            log_step_complete "✅ Cleaned stale trees from ${last_device} ($(elapsed_since_step))"
+        fi
+    fi
+
+    # Record active device and its trees for next run
+    mkdir -p .repo
+    echo "$DEVICE_CODE" > "$last_device_file" 2>/dev/null || true
+    printf '%s\n' "${current_device_paths[@]}" > "$last_trees_file" 2>/dev/null || true
 
     if [[ $SKIP_SYNC -eq 0 ]]; then
         # --- STEP 1: INITIALIZE & SYNC ---

@@ -36,6 +36,16 @@ on:
         default: ''
         type: string
 
+      BUILD_VARIANT:
+        description: 'Build variant (userdebug, user, eng)'
+        required: false
+        default: 'userdebug'
+        type: choice
+        options:
+          - 'userdebug'
+          - 'user'
+          - 'eng'
+
       BUILD_COMMAND:
         description: 'Build args (e.g. "--nosync --nosyncd", "--reset --tree1=kernel:test", leave empty for default bacon build)'
         required: false
@@ -529,12 +539,14 @@ jobs:
           DEVICE="${{ github.event.inputs.DEVICE || 'lemonade' }}"
           DEVICE="${DEVICE:-lemonade}"
           DEVICE_CONFIG_URL="${{ github.event.inputs.DEVICE_CONFIG_URL || '' }}"
+          BUILD_VARIANT="${{ github.event.inputs.BUILD_VARIANT || 'userdebug' }}"
+          BUILD_VARIANT="${BUILD_VARIANT:-userdebug}"
 
           bash "$MONITOR_SCRIPT" "$LOG_FILE" "$STEP_PID" "$PROJECTFOLDER" "$attempt" "$MAX_RETRIES" "$BUILD_COMMAND" "$RUN_URL" "0" "$DEVICE" &
           MONITOR_PID=$!
-          echo "Monitor started for device ${DEVICE} (PID: $MONITOR_PID)"
+          echo "Monitor started for device ${DEVICE} (${BUILD_VARIANT}) (PID: $MONITOR_PID)"
 
-          DEVICE_ARGS="--device=${DEVICE} --device-base-url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}"
+          DEVICE_ARGS="--device=${DEVICE} --variant=${BUILD_VARIANT} --device-base-url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}"
           if [[ -n "$DEVICE_CONFIG_URL" ]]; then
             DEVICE_ARGS="${DEVICE_ARGS} --device-config=${DEVICE_CONFIG_URL}"
           fi
