@@ -125,6 +125,7 @@ CURRENT_DETAIL="Handing off to crave..."
 COMPLETED_STEPS=""
 BUILD_MODULES="${BUILD_COMMAND:-bacon}"
 DEVICE_NAME="${9:-lemonade}"
+BUILD_VARIANT="${10:-userdebug}"
 ROM_NAME="Lunaris"
 ANDROID_VER="16"
 LAST_EDIT_EPOCH=0
@@ -361,7 +362,9 @@ build_message() {
     esac
 
     # ── Persistent info block (always shown) ──
-    local info="• Device: ${DEVICE_NAME}  |  Modules: ${BUILD_MODULES}
+    local variant_str=""
+    [[ -n "${BUILD_VARIANT:-}" ]] && variant_str=" (${BUILD_VARIANT})"
+    local info="• Device: ${DEVICE_NAME}${variant_str}  |  Modules: ${BUILD_MODULES}
 • ROM: ${ROM_NAME} (Android ${ANDROID_VER})
 • Started: ${START_FMT}  |  Elapsed: ${elapsed_str}"
     if [[ -n "$MAX_RETRIES" && "$MAX_RETRIES" -gt 1 ]]; then
@@ -775,11 +778,12 @@ parse_line() {
                 local k="${kv%%=*}" v="${kv#*=}"
                 case "$k" in
                     device)  DEVICE_NAME="$v" ;;
+                    variant) BUILD_VARIANT="$v" ;;
                     rom)     ROM_NAME="$v" ;;
                     android) ANDROID_VER="$v" ;;
                 esac
             done
-            dbg "Config: device=$DEVICE_NAME rom=$ROM_NAME android=$ANDROID_VER"
+            dbg "Config: device=$DEVICE_NAME variant=$BUILD_VARIANT rom=$ROM_NAME android=$ANDROID_VER"
             ;;
         *"[VOLT_MODULES]"*)
             BUILD_MODULES="${line#*\[VOLT_MODULES\] }"

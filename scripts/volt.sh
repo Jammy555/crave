@@ -829,7 +829,15 @@ start_build_process() {
 # MAIN EXECUTION
 # =============================================================================
 echo "[VOLT_START] LunarisOS Build — $(date '+%Y-%m-%d %H:%M:%S %Z')"
-echo "[VOLT_CONFIG] device=${DEVICE_CODE} rom=${BUILD_TARGET} android=${ANDROID_VERSION} branch=${MANIFEST_BRANCH}"
+ACTIVE_VARIANT="${BUILD_VARIANT:-}"
+if [[ -z "$ACTIVE_VARIANT" ]]; then
+    if [[ "$LUNCH_TARGET" =~ -(userdebug|user|eng)$ ]]; then
+        ACTIVE_VARIANT="${BASH_REMATCH[1]}"
+    else
+        ACTIVE_VARIANT="userdebug"
+    fi
+fi
+echo "[VOLT_CONFIG] device=${DEVICE_CODE} variant=${ACTIVE_VARIANT} rom=${BUILD_TARGET} android=${ANDROID_VERSION} branch=${MANIFEST_BRANCH}"
 echo "[VOLT_MODULES] ${BUILD_MODULES[*]}"
 log_step_complete "✅ Initialization"
 start_build_process

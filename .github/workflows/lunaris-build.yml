@@ -542,7 +542,7 @@ jobs:
           BUILD_VARIANT="${{ github.event.inputs.BUILD_VARIANT || 'userdebug' }}"
           BUILD_VARIANT="${BUILD_VARIANT:-userdebug}"
 
-          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$STEP_PID" "$PROJECTFOLDER" "$attempt" "$MAX_RETRIES" "$BUILD_COMMAND" "$RUN_URL" "0" "$DEVICE" &
+          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$STEP_PID" "$PROJECTFOLDER" "$attempt" "$MAX_RETRIES" "$BUILD_COMMAND" "$RUN_URL" "0" "$DEVICE" "$BUILD_VARIANT" &
           MONITOR_PID=$!
           echo "Monitor started for device ${DEVICE} (${BUILD_VARIANT}) (PID: $MONITOR_PID)"
 
