@@ -18,6 +18,7 @@ declare -g -A TREE_LOOKUP=(
     [hardware]="https://github.com/LineageOS/android_hardware_motorola.git|./hardware/motorola|hardware|lineage-23.2"
     [vendor]="https://github.com/Jammy555/vendor_motorola_capri.git|./vendor/motorola/capri|vendor capri|lineage-23.2"
     [vendor-common]="https://github.com/Jammy555/vendor_motorola_sm6225-common.git|./vendor/motorola/sm6225-common|vendor common|16.2"
+    [dolby]="https://github.com/Jammy555/vendor_oneplus_dolby.git|./vendor/sony/dolby|dolby|D2"
 )
 
 # --- Signing keys (optional) -------------------------------------------------
