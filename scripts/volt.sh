@@ -91,63 +91,45 @@ TREE1_NAME=""; TREE1_BRANCH=""
 TREE2_NAME=""; TREE2_BRANCH=""
 
 # =============================================================================
-# DEVICE CONFIG LOADER
+# DEVICE CONFIG RESOLVER
 # =============================================================================
-load_device_config() {
-    local cfg_loaded=0
-
+resolve_device_config() {
     # 1. Explicit config file or URL passed via --device-config=
     if [[ -n "$DEVICE_CONFIG_FILE" ]]; then
         if [[ "$DEVICE_CONFIG_FILE" =~ ^https?:// ]]; then
             local tmp_cfg="/tmp/volt_device_${DEVICE_CODE}_$$.sh"
-            echo "[VOLT_STATUS] Config ⚙️|Downloading device config from ${DEVICE_CONFIG_FILE}..."
-            if curl -LSs "$DEVICE_CONFIG_FILE" -o "$tmp_cfg" 2>/dev/null && [[ -s "$tmp_cfg" ]]; then
-                # shellcheck disable=SC1090
-                source "$tmp_cfg" && cfg_loaded=1
-                rm -f "$tmp_cfg"
-            else
-                die "Failed to download device config from ${DEVICE_CONFIG_FILE}"
+            echo "[VOLT_STATUS] Config ⚙️|Downloading device config from ${DEVICE_CONFIG_FILE}..." >&2
+            if curl -fLSs "$DEVICE_CONFIG_FILE" -o "$tmp_cfg" 2>/dev/null && [[ -s "$tmp_cfg" ]]; then
+                echo "$tmp_cfg"
+                return 0
             fi
+            return 1
         elif [[ -f "$DEVICE_CONFIG_FILE" ]]; then
-            # shellcheck disable=SC1090
-            source "$DEVICE_CONFIG_FILE" && cfg_loaded=1
-        else
-            die "Device config file not found: ${DEVICE_CONFIG_FILE}"
+            echo "$DEVICE_CONFIG_FILE"
+            return 0
         fi
+        return 1
     fi
 
     # 2. Local devices/<device>.sh in workspace or relative path
-    if [[ $cfg_loaded -eq 0 ]]; then
-        for candidate in "devices/${DEVICE_CODE}.sh" "./devices/${DEVICE_CODE}.sh" "$(dirname "$0")/../devices/${DEVICE_CODE}.sh"; do
-            if [[ -f "$candidate" ]]; then
-                # shellcheck disable=SC1090
-                source "$candidate" && cfg_loaded=1
-                break
-            fi
-        done
-    fi
+    for candidate in "devices/${DEVICE_CODE}.sh" "./devices/${DEVICE_CODE}.sh" "$(dirname "$0")/../devices/${DEVICE_CODE}.sh"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
 
     # 3. Remote download from repo
-    if [[ $cfg_loaded -eq 0 && -n "$DEVICE_BASE_URL" ]]; then
+    if [[ -n "$DEVICE_BASE_URL" ]]; then
         local remote_url="${DEVICE_BASE_URL}/devices/${DEVICE_CODE}.sh"
         local tmp_cfg="/tmp/volt_device_${DEVICE_CODE}_$$.sh"
-        if curl -LSs "$remote_url" -o "$tmp_cfg" 2>/dev/null && [[ -s "$tmp_cfg" ]] && ! grep -qi "404: Not Found" "$tmp_cfg"; then
-            # shellcheck disable=SC1090
-            source "$tmp_cfg" && cfg_loaded=1
-            rm -f "$tmp_cfg"
+        if curl -fLSs "$remote_url" -o "$tmp_cfg" 2>/dev/null && [[ -s "$tmp_cfg" ]]; then
+            echo "$tmp_cfg"
+            return 0
         fi
     fi
 
-    if [[ $cfg_loaded -eq 0 ]]; then
-        if [[ ${#TREE_LOOKUP[@]} -eq 0 ]]; then
-            die "Could not load device configuration for '${DEVICE_CODE}'. Ensure devices/${DEVICE_CODE}.sh exists or pass --device-config=<url_or_path>."
-        fi
-    fi
-
-    # Fallback default for LUNCH_TARGET if not set by device file or --lunch flag
-    if [[ -z "$LUNCH_TARGET" ]]; then
-        LUNCH_TARGET="lineage_${DEVICE_CODE}-bp4a-userdebug"
-    fi
+    return 1
 }
 
 # =============================================================================
@@ -214,7 +196,16 @@ for arg in "$@"; do
     esac
 done
 
-load_device_config
+DEVICE_CFG_PATH=$(resolve_device_config) || die "Could not load device configuration for '${DEVICE_CODE}'. Ensure devices/${DEVICE_CODE}.sh exists or pass --device-config=<url_or_path>."
+
+# Sourced at top level so declare -A in device config is ALWAYS global
+# shellcheck disable=SC1090
+source "$DEVICE_CFG_PATH"
+
+# Fallback default for LUNCH_TARGET if not set by device file or --lunch flag
+if [[ -z "$LUNCH_TARGET" ]]; then
+    LUNCH_TARGET="lineage_${DEVICE_CODE}-bp4a-userdebug"
+fi
 
 # --- Pass 2: Parse remaining flags and modules ---
 for arg in "$@"; do
