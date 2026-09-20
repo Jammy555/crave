@@ -268,22 +268,82 @@ jobs:
     steps:
     - name: Find or create project clone
       run: |
-        echo "Checking for existing crave clones in /crave-devspaces/..."
-        CLONE_PATH=""
-        for d in /crave-devspaces/*; do
-          if [[ -d "$d" && "$d" != "/crave-devspaces/lost+found" ]]; then
-            CLONE_PATH="$d"
-            break
-          fi
-        done
+        DEVICE="${{ github.event.inputs.DEVICE || 'lemonade' }}"
+        DEVICE="${DEVICE:-lemonade}"
+        DEVICE_CONFIG_URL="${{ github.event.inputs.DEVICE_CONFIG_URL || '' }}"
 
-        if [[ -n "$CLONE_PATH" && -d "$CLONE_PATH" ]]; then
-          echo "Found existing clone at: $CLONE_PATH"
+        CRAVE_PROJECT_ID=""
+        CRAVE_CLONE_PATH=""
+
+        # 1. Try loading CRAVE_PROJECT_ID and CRAVE_CLONE_PATH from custom device config URL
+        CFG_TMP="/tmp/volt_dev_cfg_$$.sh"
+        if [[ -n "$DEVICE_CONFIG_URL" ]]; then
+          echo "Fetching device config from: $DEVICE_CONFIG_URL"
+          if curl -sSL "$DEVICE_CONFIG_URL" -o "$CFG_TMP" 2>/dev/null && [[ -s "$CFG_TMP" ]]; then
+            CRAVE_PROJECT_ID=$(bash -c "source '$CFG_TMP' 2>/dev/null && echo \"\$CRAVE_PROJECT_ID\"" || true)
+            CRAVE_CLONE_PATH=$(bash -c "source '$CFG_TMP' 2>/dev/null && echo \"\$CRAVE_CLONE_PATH\"" || true)
+          fi
+        fi
+
+        # 2. Try fetching from the repository if not found yet
+        if [[ -z "$CRAVE_PROJECT_ID" || -z "$CRAVE_CLONE_PATH" ]]; then
+          REPO_CFG_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/devices/${DEVICE}.sh"
+          echo "Fetching device config from: $REPO_CFG_URL"
+          if curl -sSL "$REPO_CFG_URL" -o "$CFG_TMP" 2>/dev/null && [[ -s "$CFG_TMP" ]]; then
+            CRAVE_PROJECT_ID=$(bash -c "source '$CFG_TMP' 2>/dev/null && echo \"\$CRAVE_PROJECT_ID\"" || true)
+            CRAVE_CLONE_PATH=$(bash -c "source '$CFG_TMP' 2>/dev/null && echo \"\$CRAVE_CLONE_PATH\"" || true)
+          fi
+        fi
+        rm -f "$CFG_TMP"
+
+        # 3. Fallback defaults for known devices if not set by config
+        if [[ -z "$CRAVE_PROJECT_ID" || -z "$CRAVE_CLONE_PATH" ]]; then
+          case "$DEVICE" in
+            capri)
+              CRAVE_PROJECT_ID="99"
+              CRAVE_CLONE_PATH="/crave-devspaces/Lineage23.2"
+              ;;
+            lemonade|*)
+              CRAVE_PROJECT_ID="93"
+              CRAVE_CLONE_PATH="/crave-devspaces/Lineage22.1"
+              ;;
+          esac
+        fi
+
+        echo "Target Crave Clone for ${DEVICE}:"
+        echo "  Project ID: ${CRAVE_PROJECT_ID}"
+        echo "  Clone Path: ${CRAVE_CLONE_PATH}"
+
+        CLONE_PATH=""
+        if [[ -d "$CRAVE_CLONE_PATH" ]]; then
+          echo "Found existing clone at: $CRAVE_CLONE_PATH"
+          CLONE_PATH="$CRAVE_CLONE_PATH"
         else
-          echo "No clone found. Creating one..."
-          CLONE_PATH="/crave-devspaces/Lineage22.1"
-          crave clone create --projectID 93 "$CLONE_PATH" || true
-          echo "Clone ready at: $CLONE_PATH"
+          echo "No clone found at $CRAVE_CLONE_PATH. Creating clone for project ID ${CRAVE_PROJECT_ID}..."
+          if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" -d "parse_mode=HTML" \
+              --data-urlencode "text=📦 Initializing Crave clone for <b>${DEVICE}</b> (LOS project ${CRAVE_PROJECT_ID} → <code>${CRAVE_CLONE_PATH}</code>)..." > /dev/null 2>&1 || true
+          fi
+          crave clone create --projectID "${CRAVE_PROJECT_ID}" "$CRAVE_CLONE_PATH" || true
+          if [[ -d "$CRAVE_CLONE_PATH" ]]; then
+            echo "Clone created successfully at: $CRAVE_CLONE_PATH"
+            CLONE_PATH="$CRAVE_CLONE_PATH"
+          else
+            echo "WARNING: Failed to create clone at $CRAVE_CLONE_PATH. Checking for fallback clones in /crave-devspaces/..."
+            for d in /crave-devspaces/*; do
+              if [[ -d "$d" && "$d" != "/crave-devspaces/lost+found" ]]; then
+                CLONE_PATH="$d"
+                echo "Fallback clone found at: $CLONE_PATH"
+                break
+              fi
+            done
+          fi
+        fi
+
+        if [[ -z "$CLONE_PATH" || ! -d "$CLONE_PATH" ]]; then
+          echo "::error::No valid clone directory found in /crave-devspaces/"
+          exit 1
         fi
 
         echo "PROJECTFOLDER=$CLONE_PATH" >> "$GITHUB_ENV"

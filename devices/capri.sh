@@ -10,6 +10,10 @@ DEVICE_CODE="capri"
 DEVICE_NAME="Motorola Moto G10 / G10 Power (capri)"
 LUNCH_TARGET="${LUNCH_TARGET:-lineage_capri-bp4a-userdebug}"
 
+# --- Crave Project & Clone ---------------------------------------------------
+CRAVE_PROJECT_ID="99"
+CRAVE_CLONE_PATH="/crave-devspaces/Lineage23.2"
+
 # --- Tree lookup: "repo_url|local_path|display_name|default_branch" --------
 declare -g -A TREE_LOOKUP=(
     [kernel]="https://github.com/Jammy555/kernel_motorola_sm6225.git|./kernel/motorola/sm6225|kernel|16.2"

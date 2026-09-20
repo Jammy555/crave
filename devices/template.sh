@@ -14,6 +14,12 @@ DEVICE_CODE="mydevice"
 DEVICE_NAME="My Device Brand Model (mydevice)"
 LUNCH_TARGET="${LUNCH_TARGET:-lineage_mydevice-bp4a-userdebug}"
 
+# --- Crave Project & Clone (Optional) ----------------------------------------
+# Set CRAVE_PROJECT_ID to match the project ID from `crave clone list`
+# and CRAVE_CLONE_PATH to a dedicated directory under /crave-devspaces/
+CRAVE_PROJECT_ID="99"
+CRAVE_CLONE_PATH="/crave-devspaces/Lineage23.2"
+
 # --- Tree lookup: "repo_url|local_path|display_name|default_branch" --------
 # Define all device-specific git repositories required for this build.
 # You can add or remove entries as needed.

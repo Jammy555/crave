@@ -10,6 +10,10 @@ DEVICE_CODE="lemonade"
 DEVICE_NAME="OnePlus 9 (lemonade)"
 LUNCH_TARGET="${LUNCH_TARGET:-lineage_lemonade-bp4a-userdebug}"
 
+# --- Crave Project & Clone ---------------------------------------------------
+CRAVE_PROJECT_ID="93"
+CRAVE_CLONE_PATH="/crave-devspaces/Lineage22.1"
+
 # --- Tree lookup: "repo_url|local_path|display_name|default_branch" --------
 declare -g -A TREE_LOOKUP=(
     [kernel]="https://github.com/Jammy555/android_kernel_oneplus_sm8350.git|./kernel/oneplus/sm8350|kernel|16.2"

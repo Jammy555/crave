@@ -255,21 +255,24 @@ mka target-files-package otatools; /opt/crave/crave_sign.sh
 The build system features a modular multi-device architecture. Device tree sources, vendor files, hardware repos, signing keys, and lunch targets are decoupled into standalone configuration files in `devices/`.
 
 ### Supported Out-of-the-Box
-- **OnePlus 9 (`lemonade`)**: `devices/lemonade.sh` (SM8350 platform, OPlus hardware, camera, dolby, pixelworks)
-- **Motorola Moto G10 / G10 Power (`capri`)**: `devices/capri.sh` (SM6225 platform, Motorola hardware, vendor common)
+- **OnePlus 9 (`lemonade`)**: `devices/lemonade.sh` (SM8350 platform, OPlus hardware, camera, dolby, pixelworks; Crave Project 93 / `Lineage22.1`)
+- **Motorola Moto G10 / G10 Power (`capri`)**: `devices/capri.sh` (SM6225 platform, Motorola hardware, vendor common, dolby; Crave Project 99 / `Lineage23.2`)
 
 ### Running Builds via GitHub Actions
 When triggering the **Lunaris Build System** workflow via `workflow_dispatch`:
 1. **`DEVICE`**: Enter the device codename (`lemonade`, `capri`, or any custom device).
 2. **`DEVICE_CONFIG_URL`** (Optional): Provide a direct raw URL to an external `.sh` device configuration to build without committing to the repo.
-3. **`BUILD_COMMAND`** (Optional): Pass extra flags like `--nosync --nosyncd`, `--tree1=kernel:test`, etc.
+3. **`BUILD_VARIANT`**: Choose `userdebug`, `user`, or `eng` (automatically modifies lunch target).
+4. **`BUILD_COMMAND`** (Optional): Pass extra flags like `--nosync --nosyncd`, `--tree1=kernel:test`, etc.
+
+The workflow automatically matches and provisions dedicated Crave devspace clones (`/crave-devspaces/Lineage23.2` for `capri`, `/crave-devspaces/Lineage22.1` for `lemonade`) so neither device pollutes or wipes the other's compiled ninja caches!
 
 ### Running Directly via Crave CLI
 ```bash
-# Build capri
+# Build capri (run inside /crave-devspaces/Lineage23.2)
 crave run --no-patch -- "curl -LSs https://raw.githubusercontent.com/<REPO>/refs/heads/<BRANCH>/scripts/volt.sh | bash -s -- --device=capri bacon"
 
-# Build lemonade with a kernel branch switch
+# Build lemonade (run inside /crave-devspaces/Lineage22.1)
 crave run --no-patch -- "curl -LSs https://raw.githubusercontent.com/<REPO>/refs/heads/<BRANCH>/scripts/volt.sh | bash -s -- --device=lemonade --tree1=kernel:test bacon"
 
 # Build with a custom device config from URL
@@ -282,6 +285,8 @@ crave run --no-patch -- "curl -LSs https://raw.githubusercontent.com/<REPO>/refs
    - `DEVICE_CODE="your_codename"`
    - `DEVICE_NAME="Display Name"`
    - `LUNCH_TARGET="lineage_<codename>-bp4a-userdebug"`
+   - `CRAVE_PROJECT_ID`: Crave Project ID from `crave clone list` (e.g. `99` for LOS 23.2, `93` for LOS 22.1).
+   - `CRAVE_CLONE_PATH`: Dedicated clone path under `/crave-devspaces/`.
    - `TREE_LOOKUP`: Associative array of git repositories to clone.
    - `KEYS_REPO` / `KEYS_DIR`: Optional private signing keys template.
 3. Commit and push, or load it via `--device-config=<url>`.
