@@ -41,26 +41,24 @@ set -m
 
 # --- Build identity ---------------------------------------------------------
 DEVICE_CODE="lemonade"
+DEVICE_CONFIG_FILE=""
+DEVICE_BASE_URL="${DEVICE_BASE_URL:-https://raw.githubusercontent.com/${GITHUB_REPOSITORY:-Jammy555/crave}/refs/heads/${GITHUB_REF_NAME:-main}}"
+LUNCH_TARGET=""
 BUILD_TARGET="Lunaris"
 ANDROID_VERSION="16"
 MANIFEST_URL="https://github.com/Lunaris-AOSP/android.git"
 MANIFEST_BRANCH="16.2"
 
-# --- Sync history markers -----------------------------------------------
+# --- Signing keys (populated by device config if applicable) ----------------
+KEYS_REPO=""
+KEYS_BRANCH="master"
+KEYS_DIR=""
+
+# --- Sync history markers ---------------------------------------------------
 SYNC_HISTORY_FILE=".repo/.volt_sync_history"
 
-# --- Tree lookup: "repo_url|local_path|display_name|default_branch" --------
-declare -A TREE_LOOKUP=(
-    [kernel]="https://github.com/Jammy555/android_kernel_oneplus_sm8350.git|./kernel/oneplus/sm8350|kernel|16.2"
-    [device]="https://github.com/Jammy555/android_device_oneplus_lemonade.git|./device/oneplus/lemonade|device tree|LUN"
-    [common]="https://github.com/Jammy555/android_device_oneplus_sm8350-common.git|./device/oneplus/sm8350-common|common tree|16.2"
-    [hardware]="https://github.com/Jammy555/hardware_oplus.git|./hardware/oplus|hardware|16.2"
-    [vendor]="https://github.com/Jammy555/vendor_oneplus_lemonade.git|./vendor/oneplus/lemonade|vendor lemonade|VOS-t"
-    [vendor-common]="https://github.com/Jammy555/vendor_oneplus_sm8350-common.git|./vendor/oneplus/sm8350-common|vendor common|Lun"
-    [camera]="https://github.com/Jammy555/vendor_oplus_camera.git|./vendor/oplus/camera|oplus camera|16"
-    [dolby]="https://github.com/Jammy555/vendor_oneplus_dolby.git|./vendor/sony/dolby|dolby|D2"
-    [pixelworks]="https://github.com/LineageOS/android_hardware_pixelworks_interfaces.git|hardware/pixelworks/interfaces|pixelworks|lineage-23.2"
-)
+# --- Tree lookup: "repo_url|local_path|display_name|default_branch" ---------
+declare -A TREE_LOOKUP=()
 
 # --- Tunables ---------------------------------------------------------------
 POLL_INTERVAL_SECONDS=10
@@ -93,6 +91,66 @@ TREE1_NAME=""; TREE1_BRANCH=""
 TREE2_NAME=""; TREE2_BRANCH=""
 
 # =============================================================================
+# DEVICE CONFIG LOADER
+# =============================================================================
+load_device_config() {
+    local cfg_loaded=0
+
+    # 1. Explicit config file or URL passed via --device-config=
+    if [[ -n "$DEVICE_CONFIG_FILE" ]]; then
+        if [[ "$DEVICE_CONFIG_FILE" =~ ^https?:// ]]; then
+            local tmp_cfg="/tmp/volt_device_${DEVICE_CODE}_$$.sh"
+            echo "[VOLT_STATUS] Config ⚙️|Downloading device config from ${DEVICE_CONFIG_FILE}..."
+            if curl -LSs "$DEVICE_CONFIG_FILE" -o "$tmp_cfg" 2>/dev/null && [[ -s "$tmp_cfg" ]]; then
+                # shellcheck disable=SC1090
+                source "$tmp_cfg" && cfg_loaded=1
+                rm -f "$tmp_cfg"
+            else
+                die "Failed to download device config from ${DEVICE_CONFIG_FILE}"
+            fi
+        elif [[ -f "$DEVICE_CONFIG_FILE" ]]; then
+            # shellcheck disable=SC1090
+            source "$DEVICE_CONFIG_FILE" && cfg_loaded=1
+        else
+            die "Device config file not found: ${DEVICE_CONFIG_FILE}"
+        fi
+    fi
+
+    # 2. Local devices/<device>.sh in workspace or relative path
+    if [[ $cfg_loaded -eq 0 ]]; then
+        for candidate in "devices/${DEVICE_CODE}.sh" "./devices/${DEVICE_CODE}.sh" "$(dirname "$0")/../devices/${DEVICE_CODE}.sh"; do
+            if [[ -f "$candidate" ]]; then
+                # shellcheck disable=SC1090
+                source "$candidate" && cfg_loaded=1
+                break
+            fi
+        done
+    fi
+
+    # 3. Remote download from repo
+    if [[ $cfg_loaded -eq 0 && -n "$DEVICE_BASE_URL" ]]; then
+        local remote_url="${DEVICE_BASE_URL}/devices/${DEVICE_CODE}.sh"
+        local tmp_cfg="/tmp/volt_device_${DEVICE_CODE}_$$.sh"
+        if curl -LSs "$remote_url" -o "$tmp_cfg" 2>/dev/null && [[ -s "$tmp_cfg" ]] && ! grep -qi "404: Not Found" "$tmp_cfg"; then
+            # shellcheck disable=SC1090
+            source "$tmp_cfg" && cfg_loaded=1
+            rm -f "$tmp_cfg"
+        fi
+    fi
+
+    if [[ $cfg_loaded -eq 0 ]]; then
+        if [[ ${#TREE_LOOKUP[@]} -eq 0 ]]; then
+            die "Could not load device configuration for '${DEVICE_CODE}'. Ensure devices/${DEVICE_CODE}.sh exists or pass --device-config=<url_or_path>."
+        fi
+    fi
+
+    # Fallback default for LUNCH_TARGET if not set by device file or --lunch flag
+    if [[ -z "$LUNCH_TARGET" ]]; then
+        LUNCH_TARGET="lineage_${DEVICE_CODE}-bp4a-userdebug"
+    fi
+}
+
+# =============================================================================
 # USAGE / HELP
 # =============================================================================
 print_usage() {
@@ -105,6 +163,11 @@ LunarisOS build script (volt.sh) — usage:
   include it.
 
 FLAGS
+  --device=<codename>           Target device (default: lemonade).
+                                Loads devices/<codename>.sh from repo or local.
+  --device-config=<path|url>    Path or URL to a custom device script.
+  --device-base-url=<url>       Base URL for remote device scripts.
+  --lunch=<target>              Override lunch target (e.g. lineage_capri-bp4a-userdebug).
   --nosync                      Skip syncing + cloning, rebuild from disk.
   --nosyncd                     Skip device tree cloning only.
   --reset[=<paths>]             Hard reset (git reset --hard && clean -fd).
@@ -113,9 +176,8 @@ FLAGS
   --tree1=<name>:<branch>       Switch ONE tree to a different branch before
                                  building (fetch+reset, then mka installclean).
   --tree2=<name>:<branch>       A second, independent tree switch.
-                                 <name> must be one of: kernel, device, common,
-                                 hardware, vendor, vendor-common, camera, dolby,
-                                 pixelworks
+                                 <name> must be one of the trees defined for
+                                 the active device.
   --manifest-branch=<branch>    Override the WHOLE ROM manifest branch.
   -h, --help                    Show this help and exit.
 
@@ -124,10 +186,8 @@ MODULES — max 2 per run
   SAME module. A word starting with "-" starts a SECOND module.
   No module given → defaults to "bacon" (the full flashable zip).
 
-  Example:  ...volt.sh | bash -s -- --tree1=kernel:test KeyHandler -bacon
-    1) switch the kernel tree to branch "test", mka installclean
-    2) build KeyHandler (module 1)
-    3) build bacon (module 2) — even if module 1 failed
+  Example:  ...volt.sh | bash -s -- --device=capri bacon
+  Example:  ...volt.sh | bash -s -- --device=lemonade --tree1=kernel:test KeyHandler -bacon
 USAGE_EOF
 }
 
@@ -140,10 +200,30 @@ RUN_RESET=0
 RESET_TARGETS=""
 CLEAN_ARGS=()
 
+# --- Pass 1: Extract device flags to load device configuration first ---
+for arg in "$@"; do
+    case "$arg" in
+        --device=*)
+            DEVICE_CODE="${arg#*=}" ;;
+        --device-config=*)
+            DEVICE_CONFIG_FILE="${arg#*=}" ;;
+        --device-base-url=*)
+            DEVICE_BASE_URL="${arg#*=}" ;;
+        --lunch=*)
+            LUNCH_TARGET="${arg#*=}" ;;
+    esac
+done
+
+load_device_config
+
+# --- Pass 2: Parse remaining flags and modules ---
 for arg in "$@"; do
     case "$arg" in
         -h|--help)
             print_usage; exit 0 ;;
+        --device=*|--device-config=*|--device-base-url=*|--lunch=*)
+            # Handled in Pass 1
+            ;;
         --nosync)
             SKIP_SYNC=1 ;;
         --nosyncd)
@@ -163,7 +243,7 @@ for arg in "$@"; do
                 exit 1
             fi
             if [[ -z "${TREE_LOOKUP[$TREE1_NAME]:-}" ]]; then
-                echo "ERROR: unknown tree '${TREE1_NAME}' in --tree1. Valid: ${!TREE_LOOKUP[*]}" >&2
+                echo "ERROR: unknown tree '${TREE1_NAME}' in --tree1. Valid trees for ${DEVICE_CODE}: ${!TREE_LOOKUP[*]}" >&2
                 exit 1
             fi
             ;;
@@ -176,7 +256,7 @@ for arg in "$@"; do
                 exit 1
             fi
             if [[ -z "${TREE_LOOKUP[$TREE2_NAME]:-}" ]]; then
-                echo "ERROR: unknown tree '${TREE2_NAME}' in --tree2. Valid: ${!TREE_LOOKUP[*]}" >&2
+                echo "ERROR: unknown tree '${TREE2_NAME}' in --tree2. Valid trees for ${DEVICE_CODE}: ${!TREE_LOOKUP[*]}" >&2
                 exit 1
             fi
             ;;
@@ -505,21 +585,38 @@ start_build_process() {
     # --- STEP 2: CLONE OR UPDATE DEVICE TREES ---
     if [[ $SKIP_SYNC_DEVICE -eq 0 ]]; then
         step_start
-        clone_default kernel
-        clone_default device
-        clone_default common
-        clone_default hardware
-        clone_default vendor
-        clone_default vendor-common
-        clone_default camera
-        clone_default dolby
-        clone_default pixelworks
 
-        if [ -d "vendor/lineage-priv/keys" ]; then
-            log_status "Cloning Trees 🌲" "Wiping old keys folder..."
-            rm -rf vendor/lineage-priv/keys
+        # Sort tree keys for clean deterministic clone order
+        local sorted_keys=()
+        for preferred in kernel device common hardware vendor vendor-common; do
+            if [[ -n "${TREE_LOOKUP[$preferred]:-}" ]]; then
+                sorted_keys+=("$preferred")
+            fi
+        done
+        for k in "${!TREE_LOOKUP[@]}"; do
+            if [[ ! " ${sorted_keys[*]} " =~ " ${k} " ]]; then
+                sorted_keys+=("$k")
+            fi
+        done
+
+        for tree_key in "${sorted_keys[@]}"; do
+            clone_default "$tree_key"
+        done
+
+        # Signing keys (if configured for this device)
+        if [[ -n "${KEYS_REPO:-}" && -n "${KEYS_DIR:-}" ]]; then
+            if [ -d "$KEYS_DIR" ]; then
+                log_status "Cloning Trees 🌲" "Wiping old keys folder (${KEYS_DIR})..."
+                rm -rf "$KEYS_DIR"
+            fi
+            smart_clone "$KEYS_REPO" "${KEYS_BRANCH:-master}" "$KEYS_DIR" "signing keys"
         fi
-        smart_clone "https://github.com/Jammy555/vendor_evolution-priv_keys-template.git" "master" "vendor/lineage-priv/keys" "lineage keys"
+
+        # Optional post-clone hook
+        if declare -f post_clone_hook >/dev/null; then
+            log_status "Config ⚙️" "Running post_clone_hook for ${DEVICE_CODE}..."
+            post_clone_hook
+        fi
 
         log_step_complete "✅ Trees Cloned & Updated ($(elapsed_since_step))"
     else
@@ -543,14 +640,19 @@ start_build_process() {
 
     # --- STEP 4: ENVSETUP & LUNCH ---
     step_start
-    log_status "Environment Setup 🛠" "Running lunch command..."
+    if declare -f pre_lunch_hook >/dev/null; then
+        log_status "Environment Setup 🛠" "Running pre_lunch_hook for ${DEVICE_CODE}..."
+        pre_lunch_hook
+    fi
+
+    log_status "Environment Setup 🛠" "Running lunch ${LUNCH_TARGET}..."
     set +u
     # shellcheck disable=SC1091
     . build/envsetup.sh
-    lunch lineage_lemonade-bp4a-userdebug
+    lunch "$LUNCH_TARGET"
     local LUNCH_STATUS=$?
     if [[ $LUNCH_STATUS -ne 0 ]]; then
-        die "lunch lineage_lemonade-bp4a-userdebug failed (exit ${LUNCH_STATUS})"
+        die "lunch ${LUNCH_TARGET} failed (exit ${LUNCH_STATUS})"
     fi
     log_step_complete "✅ Environment Ready ($(elapsed_since_step))"
 
@@ -628,7 +730,7 @@ start_build_process() {
                     set +u
                     # shellcheck disable=SC1091
                     . build/envsetup.sh
-                    lunch lineage_lemonade-bp4a-userdebug
+                    lunch "$LUNCH_TARGET"
 
                     echo "[VOLT_STATUS] Building 🔨|Resuming ${target_module} after stall recovery..."
 

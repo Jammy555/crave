@@ -250,6 +250,42 @@ While building:
 mka target-files-package otatools; /opt/crave/crave_sign.sh
 ```
 
+## Multi-Device Support (`volt.sh`)
+
+The build system features a modular multi-device architecture. Device tree sources, vendor files, hardware repos, signing keys, and lunch targets are decoupled into standalone configuration files in `devices/`.
+
+### Supported Out-of-the-Box
+- **OnePlus 9 (`lemonade`)**: `devices/lemonade.sh` (SM8350 platform, OPlus hardware, camera, dolby, pixelworks)
+- **Motorola Moto G10 / G10 Power (`capri`)**: `devices/capri.sh` (SM6225 platform, Motorola hardware, vendor common)
+
+### Running Builds via GitHub Actions
+When triggering the **Lunaris Build System** workflow via `workflow_dispatch`:
+1. **`DEVICE`**: Enter the device codename (`lemonade`, `capri`, or any custom device).
+2. **`DEVICE_CONFIG_URL`** (Optional): Provide a direct raw URL to an external `.sh` device configuration to build without committing to the repo.
+3. **`BUILD_COMMAND`** (Optional): Pass extra flags like `--nosync --nosyncd`, `--tree1=kernel:test`, etc.
+
+### Running Directly via Crave CLI
+```bash
+# Build capri
+crave run --no-patch -- "curl -LSs https://raw.githubusercontent.com/<REPO>/refs/heads/<BRANCH>/scripts/volt.sh | bash -s -- --device=capri bacon"
+
+# Build lemonade with a kernel branch switch
+crave run --no-patch -- "curl -LSs https://raw.githubusercontent.com/<REPO>/refs/heads/<BRANCH>/scripts/volt.sh | bash -s -- --device=lemonade --tree1=kernel:test bacon"
+
+# Build with a custom device config from URL
+crave run --no-patch -- "curl -LSs https://raw.githubusercontent.com/<REPO>/refs/heads/<BRANCH>/scripts/volt.sh | bash -s -- --device=mydev --device-config=https://example.com/mydev.sh bacon"
+```
+
+### Adding a New Device on the Spot
+1. Copy `devices/template.sh` to `devices/<your_device_codename>.sh`.
+2. Define:
+   - `DEVICE_CODE="your_codename"`
+   - `DEVICE_NAME="Display Name"`
+   - `LUNCH_TARGET="lineage_<codename>-bp4a-userdebug"`
+   - `TREE_LOOKUP`: Associative array of git repositories to clone.
+   - `KEYS_REPO` / `KEYS_DIR`: Optional private signing keys template.
+3. Commit and push, or load it via `--device-config=<url>`.
+
 ## Star History
 
 <a href="https://star-history.com/#sounddrill31/crave_aosp_builder&Date">

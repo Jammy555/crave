@@ -24,6 +24,18 @@ name: Lunaris Build System
 on:
   workflow_dispatch:
     inputs:
+      DEVICE:
+        description: 'Target device (codename)'
+        required: false
+        default: 'lemonade'
+        type: string
+
+      DEVICE_CONFIG_URL:
+        description: 'Optional custom device config URL (.sh raw script)'
+        required: false
+        default: ''
+        type: string
+
       BUILD_COMMAND:
         description: 'Build args (e.g. "--nosync --nosyncd", "--reset --tree1=kernel:test", leave empty for default bacon build)'
         required: false
@@ -513,15 +525,25 @@ jobs:
           MONITOR_SCRIPT="/tmp/volt_monitor_$$.sh"
           curl -LSs "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/monitor.sh" -o "$MONITOR_SCRIPT"
           chmod +x "$MONITOR_SCRIPT"
-          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$STEP_PID" "$PROJECTFOLDER" "$attempt" "$MAX_RETRIES" "$BUILD_COMMAND" "$RUN_URL" &
-          MONITOR_PID=$!
-          echo "Monitor started (PID: $MONITOR_PID)"
 
-          # Build volt command string — include -s -- ONLY if arguments are passed
+          DEVICE="${{ github.event.inputs.DEVICE || 'lemonade' }}"
+          DEVICE="${DEVICE:-lemonade}"
+          DEVICE_CONFIG_URL="${{ github.event.inputs.DEVICE_CONFIG_URL || '' }}"
+
+          bash "$MONITOR_SCRIPT" "$LOG_FILE" "$STEP_PID" "$PROJECTFOLDER" "$attempt" "$MAX_RETRIES" "$BUILD_COMMAND" "$RUN_URL" "0" "$DEVICE" &
+          MONITOR_PID=$!
+          echo "Monitor started for device ${DEVICE} (PID: $MONITOR_PID)"
+
+          DEVICE_ARGS="--device=${DEVICE} --device-base-url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}"
+          if [[ -n "$DEVICE_CONFIG_URL" ]]; then
+            DEVICE_ARGS="${DEVICE_ARGS} --device-config=${DEVICE_CONFIG_URL}"
+          fi
+
+          # Build volt command string with device args
           if [[ -n "${BUILD_COMMAND}" ]]; then
-            VOLT_CMD="curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash -s -- ${BUILD_COMMAND}"
+            VOLT_CMD="curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash -s -- ${DEVICE_ARGS} ${BUILD_COMMAND}"
           else
-            VOLT_CMD="curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash"
+            VOLT_CMD="curl -LSs https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/${GITHUB_REF_NAME}/scripts/volt.sh | bash -s -- ${DEVICE_ARGS}"
           fi
 
           # Run the build — NO SECRETS in this command
@@ -575,17 +597,23 @@ jobs:
           if [[ $EXIT_CODE -eq 0 ]]; then
             echo "Build succeeded on attempt ${attempt}!"
 
-            echo "Pulling build artifacts..."
-            crave ${{ secrets.CRAVE_FLAGS }} pull "out/target/product/lemonade/Lunaris-AOSP-lemonade*.zip" 2>&1 || true
+            echo "Pulling build artifacts for ${DEVICE}..."
+            crave ${{ secrets.CRAVE_FLAGS }} pull "out/target/product/${DEVICE}/Lunaris-AOSP-${DEVICE}*.zip" 2>&1 || true
 
-            PULLED_ZIP=$(find . -maxdepth 1 -name "Lunaris-AOSP-lemonade*.zip" -type f 2>/dev/null | head -1)
+            PULLED_ZIP=$(find . -maxdepth 1 -name "Lunaris-AOSP-${DEVICE}*.zip" -type f 2>/dev/null | head -1)
 
             # Fallback: pull with explicit job ID if direct pull didn't find zip
             CURRENT_JOB_ID=$(jq -r '.jobId // empty' "${PROJECTFOLDER}/.crave_tracked_job.json" 2>/dev/null || true)
             if [[ -z "$PULLED_ZIP" && -n "$CURRENT_JOB_ID" ]]; then
               echo "Direct pull yielded no zip, trying explicit pull with --job ${CURRENT_JOB_ID}..."
-              crave ${{ secrets.CRAVE_FLAGS }} pull --job "$CURRENT_JOB_ID" "out/target/product/lemonade/Lunaris-AOSP-lemonade*.zip" 2>&1 || true
-              PULLED_ZIP=$(find . -maxdepth 1 -name "Lunaris-AOSP-lemonade*.zip" -type f 2>/dev/null | head -1)
+              crave ${{ secrets.CRAVE_FLAGS }} pull --job "$CURRENT_JOB_ID" "out/target/product/${DEVICE}/Lunaris-AOSP-${DEVICE}*.zip" 2>&1 || true
+              PULLED_ZIP=$(find . -maxdepth 1 -name "Lunaris-AOSP-${DEVICE}*.zip" -type f 2>/dev/null | head -1)
+            fi
+
+            # Fallback 2: check for any zip under out/target/product/${DEVICE}/
+            if [[ -z "$PULLED_ZIP" ]]; then
+              crave ${{ secrets.CRAVE_FLAGS }} pull "out/target/product/${DEVICE}/*.zip" 2>&1 || true
+              PULLED_ZIP=$(find . -maxdepth 1 -name "*.zip" -type f 2>/dev/null | head -1)
             fi
 
             if [[ -n "$PULLED_ZIP" && -f "$PULLED_ZIP" ]]; then
