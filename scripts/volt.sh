@@ -547,13 +547,37 @@ start_build_process() {
     # --- FOREIGN TREE CLEANUP ---------------------------------------------------
     # Android's Kati/Soong recursively scans ALL directories for Android.mk/.bp.
     # If old device trees (e.g. device/oneplus from a lemonade build) are left on
-    # disk when building capri, they pull in dependencies that don't exist for the
-    # new device and the build fails. This scanner removes any device-specific
-    # directory that is NOT listed in the current device's TREE_LOOKUP.
+    # ---------------------------------------------------------------------------
+    # FOREIGN DEVICE TREE CLEANUP
+    # ---------------------------------------------------------------------------
+    # When building multiple devices on the same Crave devspace (e.g. lemonade vs capri),
+    # foreign device trees left over on disk cause blueprint collisions and fail builds.
+    #
+    # Only genuine foreign OEM trees (OnePlus trees when building Motorola, or Motorola
+    # trees when building OnePlus) and trees from other device configs are removed.
     # ---------------------------------------------------------------------------
     local last_device_file=".repo/.volt_last_device"
+    local last_trees_file=".repo/.volt_last_device_trees"
 
-    # 1. Collect normalized local paths owned by the current device config
+    # Helper: Check if a path belongs to core AOSP / Lineage platform repositories
+    is_core_platform_repo() {
+        local target="$1"
+        target="${target#./}"
+        target="${target%/}"
+        case "$target" in
+            device/generic*|device/google*|device/google_car*|device/lineage*|device/sample*|device/common*)
+                return 0 ;;
+            hardware/google*|hardware/lineage*|hardware/nxp*|hardware/ril*|hardware/samsung*|hardware/st*|hardware/ti*|hardware/invensense*|hardware/knowles*|hardware/broadcom*|hardware/qcom*|hardware/interfaces*|hardware/libhardware*)
+                return 0 ;;
+            vendor/lineage*|vendor/pixel*|vendor/qcom*|vendor/extras*)
+                return 0 ;;
+            kernel/configs*|kernel/tests*|kernel/prebuilts*)
+                return 0 ;;
+        esac
+        return 1
+    }
+
+    # 1. Collect normalized local paths owned by the current device config (whitelist)
     local -A owned_paths=()
     for lookup in "${TREE_LOOKUP[@]}"; do
         local rest="${lookup#*|}"
@@ -563,82 +587,88 @@ start_build_process() {
         owned_paths["$tdir"]=1
     done
 
-    # 2. Define parent directories known to host device-specific subtrees.
-    #    We only scan 2 levels deep to avoid touching ROM-level repos like
-    #    build/, frameworks/, system/, etc.
-    local -a scan_roots=(
-        "device"
-        "kernel"
-        "vendor"
-        "hardware"
-    )
+    # 2. Collect candidate foreign paths to check and remove
+    local -A foreign_candidates=()
 
-    # 3. Walk each scan root and flag foreign subtrees for removal.
-    #    The logic: for each <scan_root>/<vendor>/<sub> or <scan_root>/<vendor>,
-    #    if that path is NOT in owned_paths AND contains an Android.mk or
-    #    Android.bp (i.e. it's a buildable tree, not just an empty dir),
-    #    remove it.
+    # (a) Target foreign OEM roots explicitly based on active device
+    if [[ "$DEVICE_CODE" != "lemonade" ]]; then
+        foreign_candidates["device/oneplus"]=1
+        foreign_candidates["hardware/oplus"]=1
+        foreign_candidates["hardware/pixelworks"]=1
+        foreign_candidates["vendor/oneplus"]=1
+        foreign_candidates["vendor/oplus"]=1
+        foreign_candidates["kernel/oneplus"]=1
+    fi
+    if [[ "$DEVICE_CODE" != "capri" ]]; then
+        foreign_candidates["device/motorola"]=1
+        foreign_candidates["hardware/motorola"]=1
+        foreign_candidates["vendor/motorola"]=1
+        foreign_candidates["kernel/motorola"]=1
+    fi
+
+    # (b) Discover trees from other devices/*.sh configs if available locally
+    for dev_file in "devices/"*.sh "./devices/"*.sh "$(dirname "$0")/../devices/"*.sh; do
+        [[ -f "$dev_file" ]] || continue
+        local dev_base; dev_base=$(basename "$dev_file" .sh)
+        [[ "$dev_base" == "$DEVICE_CODE" || "$dev_base" == "template" || "$dev_base" == "*" ]] && continue
+        while IFS= read -r line; do
+            if [[ "$line" =~ \[[a-zA-Z0-9_-]+\]=\"?[^\|]+\|([^\|]+)\| ]]; then
+                local fpath="${BASH_REMATCH[1]}"
+                fpath="${fpath#./}"
+                fpath="${fpath%/}"
+                foreign_candidates["$fpath"]=1
+            fi
+        done < "$dev_file"
+    done
+
+    # (c) Check recorded trees from the previous build run
+    if [[ -f "$last_trees_file" ]]; then
+        while IFS= read -r old_path; do
+            old_path="${old_path#./}"
+            old_path="${old_path%/}"
+            [[ -n "$old_path" ]] && foreign_candidates["$old_path"]=1
+        done < "$last_trees_file"
+    fi
+
+    # 3. Safely execute removal of confirmed foreign trees
     local foreign_removed=0
     step_start
-    for root in "${scan_roots[@]}"; do
-        [[ -d "$root" ]] || continue
-        # Level 1: root/vendor (e.g. device/oneplus, hardware/oplus)
-        for vendor_dir in "$root"/*/; do
-            [[ -d "$vendor_dir" ]] || continue
-            vendor_dir="${vendor_dir%/}"
-            # Level 2: root/vendor/sub (e.g. device/oneplus/lemonade)
-            local has_sub=0
-            for sub_dir in "$vendor_dir"/*/; do
-                [[ -d "$sub_dir" ]] || continue
-                sub_dir="${sub_dir%/}"
-                has_sub=1
-                # Skip if this exact path is owned by the current device
-                if [[ -n "${owned_paths[$sub_dir]:-}" ]]; then
-                    continue
-                fi
-                # Skip if this is a ROM-level repo (not device-specific)
-                # ROM repos live under vendor/lineage, vendor/pixel, vendor/extras, etc.
-                # and hardware/qcom-caf, hardware/broadcom, hardware/synaptics, etc.
-                # Device trees live under vendor/<oem>/<device>, device/<oem>/<device>, etc.
-                local vendor_name="${vendor_dir##*/}"
-                case "$root/$vendor_name" in
-                    vendor/lineage|vendor/lineage-priv|vendor/pixel|vendor/extras|vendor/sony)
-                        continue ;;
-                    vendor/qcom|hardware/qcom|hardware/qcom-caf|hardware/broadcom|hardware/synaptics|hardware/interfaces|hardware/libhardware*)
-                        continue ;;
-                    kernel/configs|kernel/tests|kernel/prebuilts)
-                        continue ;;
-                esac
-                # This looks device-specific and NOT ours — check for buildable files
-                if [[ -f "$sub_dir/Android.mk" || -f "$sub_dir/Android.bp" || -f "$sub_dir/BoardConfig.mk" || -f "$sub_dir/device.mk" ]]; then
-                    echo "  [Foreign Tree] Removing: $sub_dir (not in ${DEVICE_CODE}'s TREE_LOOKUP)"
-                    rm -rf "$sub_dir"
-                    foreign_removed=$((foreign_removed + 1))
-                fi
-            done
-            # Also check if the vendor_dir itself (without subs) is a buildable tree
-            # e.g. hardware/oplus, hardware/motorola
-            if [[ $has_sub -eq 0 || -f "$vendor_dir/Android.mk" || -f "$vendor_dir/Android.bp" ]]; then
-                if [[ -z "${owned_paths[$vendor_dir]:-}" ]]; then
-                    local vendor_name="${vendor_dir##*/}"
-                    case "$root/$vendor_name" in
-                        vendor/lineage|vendor/lineage-priv|vendor/pixel|vendor/extras|vendor/sony)
-                            continue ;;
-                        vendor/qcom|hardware/qcom|hardware/qcom-caf|hardware/broadcom|hardware/synaptics|hardware/interfaces|hardware/libhardware*)
-                            continue ;;
-                    esac
-                    if [[ -f "$vendor_dir/Android.mk" || -f "$vendor_dir/Android.bp" ]]; then
-                        echo "  [Foreign Tree] Removing: $vendor_dir (not in ${DEVICE_CODE}'s TREE_LOOKUP)"
-                        rm -rf "$vendor_dir"
-                        foreign_removed=$((foreign_removed + 1))
-                    fi
-                fi
-            fi
-            # Clean up empty vendor parent dirs
-            if [[ -d "$vendor_dir" ]] && [[ -z "$(ls -A "$vendor_dir" 2>/dev/null)" ]]; then
-                rmdir "$vendor_dir" 2>/dev/null || true
+
+    for fpath in "${!foreign_candidates[@]}"; do
+        # Absolute protection: NEVER delete anything owned by current device
+        if [[ -n "${owned_paths[$fpath]:-}" ]]; then
+            continue
+        fi
+
+        # Absolute protection: NEVER delete core AOSP / Lineage platform repositories
+        if is_core_platform_repo "$fpath"; then
+            continue
+        fi
+
+        # Check if any owned path is nested inside fpath (safety guard before deleting OEM root)
+        local has_owned_inside=0
+        for op in "${!owned_paths[@]}"; do
+            if [[ "$op" == "$fpath"/* || "$op" == "$fpath" ]]; then
+                has_owned_inside=1
+                break
             fi
         done
+        if [[ $has_owned_inside -eq 1 ]]; then
+            continue
+        fi
+
+        if [[ -e "$fpath" ]]; then
+            echo "  [Foreign Tree] Removing: $fpath (foreign to ${DEVICE_CODE})"
+            rm -rf "$fpath"
+            foreign_removed=$((foreign_removed + 1))
+
+            # Clean up empty parent directories if any
+            local pdir; pdir=$(dirname "$fpath")
+            while [[ "$pdir" != "." && "$pdir" != "/" ]]; do
+                rmdir "$pdir" 2>/dev/null || break
+                pdir=$(dirname "$pdir")
+            done
+        fi
     done
 
     # 4. Remove .repo/local_manifests — may reference old device repos
@@ -647,12 +677,17 @@ start_build_process() {
         rm -rf ".repo/local_manifests"
     fi
 
-    # 5. If the device changed, also wipe compiled outputs to avoid ninja cache poisoning
+    # 5. If the device changed, reset dirty git state in ROM repos
     if [[ -f "$last_device_file" ]]; then
         local last_device; last_device=$(cat "$last_device_file" 2>/dev/null || true)
         if [[ -n "$last_device" && "$last_device" != "$DEVICE_CODE" ]]; then
-            echo "  [Device Switch] ${last_device} → ${DEVICE_CODE}: wiping out/target/product and out/soong"
-            rm -rf out/target/product out/soong 2>/dev/null || true
+            # Reset dirty git state in ROM-level repos that may have been patched
+            # by the previous device's build system (e.g. OnePlus patches in
+            # frameworks/base, packages/apps/Settings, etc.)
+            echo "  [Device Switch] ${last_device} → ${DEVICE_CODE}: Resetting dirty git state in ROM repos..."
+            if command -v repo &>/dev/null; then
+                repo forall -c 'if [ -n "$(git status --porcelain 2>/dev/null)" ]; then echo "  [Git Reset] $(pwd)"; git checkout -- . 2>/dev/null; git clean -fd 2>/dev/null; fi' 2>/dev/null || true
+            fi
         fi
     fi
 
@@ -662,9 +697,15 @@ start_build_process() {
         log_step_complete "✅ No foreign trees found"
     fi
 
-    # Record active device for next run
+    # Emit initial stats early so Telegram shows disk/RAM/CPU even if build
+    # fails during sync or lunch (before the build watchdog loop starts)
+    LAST_STATS_TIME=0
+    emit_stats
+
+    # Record active device and its trees for next run
     mkdir -p .repo
     echo "$DEVICE_CODE" > "$last_device_file" 2>/dev/null || true
+    printf '%s\n' "${!owned_paths[@]}" > "$last_trees_file" 2>/dev/null || true
 
     if [[ $SKIP_SYNC -eq 0 ]]; then
         # --- STEP 1: INITIALIZE & SYNC ---
