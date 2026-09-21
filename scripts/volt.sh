@@ -647,12 +647,17 @@ start_build_process() {
         rm -rf ".repo/local_manifests"
     fi
 
-    # 5. If the device changed, also wipe compiled outputs to avoid ninja cache poisoning
+    # 5. If the device changed, reset dirty git state in ROM repos
     if [[ -f "$last_device_file" ]]; then
         local last_device; last_device=$(cat "$last_device_file" 2>/dev/null || true)
         if [[ -n "$last_device" && "$last_device" != "$DEVICE_CODE" ]]; then
-            echo "  [Device Switch] ${last_device} → ${DEVICE_CODE}: wiping out/target/product and out/soong"
-            rm -rf out/target/product out/soong 2>/dev/null || true
+            # Reset dirty git state in ROM-level repos that may have been patched
+            # by the previous device's build system (e.g. OnePlus patches in
+            # frameworks/base, packages/apps/Settings, etc.)
+            echo "  [Device Switch] ${last_device} → ${DEVICE_CODE}: Resetting dirty git state in ROM repos..."
+            if command -v repo &>/dev/null; then
+                repo forall -c 'if [ -n "$(git status --porcelain 2>/dev/null)" ]; then echo "  [Git Reset] $(pwd)"; git checkout -- . 2>/dev/null; git clean -fd 2>/dev/null; fi' 2>/dev/null || true
+            fi
         fi
     fi
 
@@ -661,6 +666,11 @@ start_build_process() {
     else
         log_step_complete "✅ No foreign trees found"
     fi
+
+    # Emit initial stats early so Telegram shows disk/RAM/CPU even if build
+    # fails during sync or lunch (before the build watchdog loop starts)
+    LAST_STATS_TIME=0
+    emit_stats
 
     # Record active device for next run
     mkdir -p .repo
