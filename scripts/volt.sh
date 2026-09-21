@@ -544,62 +544,127 @@ start_build_process() {
     clean_stale_locks
     mkdir -p out
 
-    # --- DEVICE SWITCH DETECTION & STALE TREE CLEANUP ---
+    # --- FOREIGN TREE CLEANUP ---------------------------------------------------
+    # Android's Kati/Soong recursively scans ALL directories for Android.mk/.bp.
+    # If old device trees (e.g. device/oneplus from a lemonade build) are left on
+    # disk when building capri, they pull in dependencies that don't exist for the
+    # new device and the build fails. This scanner removes any device-specific
+    # directory that is NOT listed in the current device's TREE_LOOKUP.
+    # ---------------------------------------------------------------------------
     local last_device_file=".repo/.volt_last_device"
-    local last_trees_file=".repo/.volt_last_device_trees"
 
-    # Extract normalized target directory paths for current device
-    local current_device_paths=()
+    # 1. Collect normalized local paths owned by the current device config
+    local -A owned_paths=()
     for lookup in "${TREE_LOOKUP[@]}"; do
         local rest="${lookup#*|}"
         local tdir="${rest%%|*}"
         tdir="${tdir#./}"
-        current_device_paths+=("$tdir")
+        tdir="${tdir%/}"
+        owned_paths["$tdir"]=1
     done
 
+    # 2. Define parent directories known to host device-specific subtrees.
+    #    We only scan 2 levels deep to avoid touching ROM-level repos like
+    #    build/, frameworks/, system/, etc.
+    local -a scan_roots=(
+        "device"
+        "kernel"
+        "vendor"
+        "hardware"
+    )
+
+    # 3. Walk each scan root and flag foreign subtrees for removal.
+    #    The logic: for each <scan_root>/<vendor>/<sub> or <scan_root>/<vendor>,
+    #    if that path is NOT in owned_paths AND contains an Android.mk or
+    #    Android.bp (i.e. it's a buildable tree, not just an empty dir),
+    #    remove it.
+    local foreign_removed=0
+    step_start
+    for root in "${scan_roots[@]}"; do
+        [[ -d "$root" ]] || continue
+        # Level 1: root/vendor (e.g. device/oneplus, hardware/oplus)
+        for vendor_dir in "$root"/*/; do
+            [[ -d "$vendor_dir" ]] || continue
+            vendor_dir="${vendor_dir%/}"
+            # Level 2: root/vendor/sub (e.g. device/oneplus/lemonade)
+            local has_sub=0
+            for sub_dir in "$vendor_dir"/*/; do
+                [[ -d "$sub_dir" ]] || continue
+                sub_dir="${sub_dir%/}"
+                has_sub=1
+                # Skip if this exact path is owned by the current device
+                if [[ -n "${owned_paths[$sub_dir]:-}" ]]; then
+                    continue
+                fi
+                # Skip if this is a ROM-level repo (not device-specific)
+                # ROM repos live under vendor/lineage, vendor/pixel, vendor/extras, etc.
+                # and hardware/qcom-caf, hardware/broadcom, hardware/synaptics, etc.
+                # Device trees live under vendor/<oem>/<device>, device/<oem>/<device>, etc.
+                local vendor_name="${vendor_dir##*/}"
+                case "$root/$vendor_name" in
+                    vendor/lineage|vendor/lineage-priv|vendor/pixel|vendor/extras|vendor/sony)
+                        continue ;;
+                    vendor/qcom|hardware/qcom|hardware/qcom-caf|hardware/broadcom|hardware/synaptics|hardware/interfaces|hardware/libhardware*)
+                        continue ;;
+                    kernel/configs|kernel/tests|kernel/prebuilts)
+                        continue ;;
+                esac
+                # This looks device-specific and NOT ours — check for buildable files
+                if [[ -f "$sub_dir/Android.mk" || -f "$sub_dir/Android.bp" || -f "$sub_dir/BoardConfig.mk" || -f "$sub_dir/device.mk" ]]; then
+                    echo "  [Foreign Tree] Removing: $sub_dir (not in ${DEVICE_CODE}'s TREE_LOOKUP)"
+                    rm -rf "$sub_dir"
+                    foreign_removed=$((foreign_removed + 1))
+                fi
+            done
+            # Also check if the vendor_dir itself (without subs) is a buildable tree
+            # e.g. hardware/oplus, hardware/motorola
+            if [[ $has_sub -eq 0 || -f "$vendor_dir/Android.mk" || -f "$vendor_dir/Android.bp" ]]; then
+                if [[ -z "${owned_paths[$vendor_dir]:-}" ]]; then
+                    local vendor_name="${vendor_dir##*/}"
+                    case "$root/$vendor_name" in
+                        vendor/lineage|vendor/lineage-priv|vendor/pixel|vendor/extras|vendor/sony)
+                            continue ;;
+                        vendor/qcom|hardware/qcom|hardware/qcom-caf|hardware/broadcom|hardware/synaptics|hardware/interfaces|hardware/libhardware*)
+                            continue ;;
+                    esac
+                    if [[ -f "$vendor_dir/Android.mk" || -f "$vendor_dir/Android.bp" ]]; then
+                        echo "  [Foreign Tree] Removing: $vendor_dir (not in ${DEVICE_CODE}'s TREE_LOOKUP)"
+                        rm -rf "$vendor_dir"
+                        foreign_removed=$((foreign_removed + 1))
+                    fi
+                fi
+            fi
+            # Clean up empty vendor parent dirs
+            if [[ -d "$vendor_dir" ]] && [[ -z "$(ls -A "$vendor_dir" 2>/dev/null)" ]]; then
+                rmdir "$vendor_dir" 2>/dev/null || true
+            fi
+        done
+    done
+
+    # 4. Remove .repo/local_manifests — may reference old device repos
+    if [[ -d ".repo/local_manifests" ]]; then
+        echo "  [Foreign Tree] Removing: .repo/local_manifests/"
+        rm -rf ".repo/local_manifests"
+    fi
+
+    # 5. If the device changed, also wipe compiled outputs to avoid ninja cache poisoning
     if [[ -f "$last_device_file" ]]; then
         local last_device; last_device=$(cat "$last_device_file" 2>/dev/null || true)
         if [[ -n "$last_device" && "$last_device" != "$DEVICE_CODE" ]]; then
-            log_status "Device Switch 🔄" "Detected switch from ${last_device} to ${DEVICE_CODE}. Cleaning stale trees..."
-            step_start
-
-            # Remove previous device trees that are not used by the new device
-            if [[ -f "$last_trees_file" ]]; then
-                while IFS= read -r old_path; do
-                    [[ -z "$old_path" ]] && continue
-                    old_path="${old_path#./}"
-                    local keep=0
-                    for cpath in "${current_device_paths[@]}"; do
-                        if [[ "$old_path" == "$cpath" ]]; then
-                            keep=1
-                            break
-                        fi
-                    done
-                    if [[ $keep -eq 0 && -d "$old_path" ]]; then
-                        echo "  [Device Switch] Removing stale tree: $old_path"
-                        rm -rf "$old_path"
-                        # Clean up empty parent directories if any
-                        local parent_dir; parent_dir=$(dirname "$old_path")
-                        while [[ "$parent_dir" != "." && "$parent_dir" != "/" ]]; do
-                            rmdir "$parent_dir" 2>/dev/null || break
-                            parent_dir=$(dirname "$parent_dir")
-                        done
-                    fi
-                done < "$last_trees_file"
-            fi
-
-            # Clean stale build outputs across device switches to avoid ninja cache poisoning
-            echo "  [Device Switch] Cleaning stale build outputs (out/target/product out/soong)..."
+            echo "  [Device Switch] ${last_device} → ${DEVICE_CODE}: wiping out/target/product and out/soong"
             rm -rf out/target/product out/soong 2>/dev/null || true
-
-            log_step_complete "✅ Cleaned stale trees from ${last_device} ($(elapsed_since_step))"
         fi
     fi
 
-    # Record active device and its trees for next run
+    if [[ $foreign_removed -gt 0 ]]; then
+        log_step_complete "✅ Removed ${foreign_removed} foreign tree(s) ($(elapsed_since_step))"
+    else
+        log_step_complete "✅ No foreign trees found"
+    fi
+
+    # Record active device for next run
     mkdir -p .repo
     echo "$DEVICE_CODE" > "$last_device_file" 2>/dev/null || true
-    printf '%s\n' "${current_device_paths[@]}" > "$last_trees_file" 2>/dev/null || true
 
     if [[ $SKIP_SYNC -eq 0 ]]; then
         # --- STEP 1: INITIALIZE & SYNC ---
