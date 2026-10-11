@@ -407,8 +407,8 @@ smart_clone() {
     log_status "Cloning Trees 🌲" "Fetching ${comp_name} (branch: ${branch})..."
 
     if [ -d "$target_dir" ]; then
-        # Bulletproof: clean up stale locks if a previous run crashed
-        rm -f "$target_dir/.git/"*.lock 2>/dev/null || true
+        # Clear stale git locks left by a crashed/cancelled run (skipped if any git/repo process is alive)
+        clean_git_locks_in "$target_dir"
         
         retry "$CLONE_MAX_ATTEMPTS" "$CLONE_RETRY_DELAY" git -C "$target_dir" fetch --depth=1 "$repo_url" "$branch" \
             || die "Failed fetching ${comp_name} (branch '${branch}' on ${repo_url})"
@@ -462,12 +462,166 @@ make_progress_bar() {
     echo "$bar"
 }
 
-# Cleans stale lock files left by killed or crashed builds
+# =============================================================================
+# LOCK + PROCESS HELPERS
+# =============================================================================
+# What the lock files really are (checked against LineageOS lineage-23.2
+# build/soong and build/make sources):
+#
+#   out/.lock                  flock(2) lock taken by soong_ui. The kernel drops it the moment the
+#                              process dies, so a leftover file can NOT block a build. Deleting it
+#                              while soong_ui is alive lets a second soong_ui lock a fresh file and
+#                              silently defeats the single-instance guard. => never deleted here.
+#   out/.ninja_lock            Not created by soong or build/make as far as we could find. Removed
+#   out/soong/.soong.in_use    only when no build process is running (harmless if absent).
+#   <tree>/.git/**/*.lock      Real existence-based git locks (index.lock, shallow.lock, refs/*.lock).
+#                              A killed/cancelled run leaves them and the next git command fails.
+#                              These are the only locks that need genuine stale cleanup.
+#
+# Cleanup is gated on "is a git/build process alive?" and NOT on file age: after a workflow
+# re-run cancels the first run, the stale locks are only seconds old.
+: "${LOCK_WAIT_SECONDS:=60}"
+BUILD_PROC_NAMES=(soong_ui soong_build ninja ckati)
+
+build_procs_running() {
+    local n
+    for n in "${BUILD_PROC_NAMES[@]}"; do
+        pgrep -x "$n" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+git_procs_running() {
+    pgrep -x git >/dev/null 2>&1 && return 0
+    pgrep -f '\.repo/repo/main\.py|(^|[ /])repo (sync|init|forall)( |$)|/opt/crave/resync\.sh' >/dev/null 2>&1
+}
+
+# wait_until_idle <seconds> <predicate...>: waits for the predicate to turn false. 0 = idle, 1 = timed out.
+wait_until_idle() {
+    local timeout="$1"; shift
+    local waited=0
+    while "$@"; do
+        (( waited >= timeout )) && return 1
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 0
+}
+
+# Deletes *.lock files under $1 and prints how many it removed.
+_rm_git_lock_files() {
+    local f n=0
+    while IFS= read -r -d '' f; do
+        rm -f -- "$f" && n=$((n + 1))
+    done < <(find "$1" -type f -name '*.lock' -print0 2>/dev/null)
+    echo "$n"
+}
+
+# One work tree that has its own .git directory (used by smart_clone).
+clean_git_locks_in() {
+    [[ -d "$1/.git" ]] || return 0
+    if git_procs_running; then
+        echo "  [Locks] git/repo process is running - leaving $1/.git locks alone" >&2
+        return 0
+    fi
+    _rm_git_lock_files "$1/.git" >/dev/null
+}
+
+# All git locks: repo-managed projects (everything under .repo) + the trees this script clones itself.
+clean_git_locks() {
+    if ! wait_until_idle "$LOCK_WAIT_SECONDS" git_procs_running; then
+        echo "  [Locks] a git/repo process is still running after ${LOCK_WAIT_SECONDS}s - leaving git locks alone" >&2
+        return 0
+    fi
+    local removed=0 lookup rest dir
+    [[ -d .repo ]] && removed=$((removed + $(_rm_git_lock_files .repo)))
+    for lookup in "${TREE_LOOKUP[@]}"; do
+        rest="${lookup#*|}"; dir="${rest%%|*}"; dir="${dir#./}"; dir="${dir%/}"
+        [[ -n "$dir" && -d "$dir/.git" ]] || continue
+        removed=$((removed + $(_rm_git_lock_files "$dir/.git")))
+    done
+    if (( removed > 0 )); then
+        echo "  [Locks] removed ${removed} stale git lock file(s)"
+    fi
+}
+
+# Soong/ninja side. Never touches out/.lock (see note above).
+clean_out_locks() {
+    if build_procs_running; then
+        echo "  [Locks] soong/ninja still running - leaving out/ lock files alone" >&2
+        return 0
+    fi
+    rm -f -- out/.ninja_lock out/soong/.soong.in_use 2>/dev/null || true
+}
+
+# After we kill a build ourselves: make sure nothing of it survived before the build is restarted.
+stop_leftover_build_procs() {
+    wait_until_idle 15 build_procs_running && return 0
+    echo "  [Locks] build processes survived the group kill - killing them by name"
+    local n
+    for n in "${BUILD_PROC_NAMES[@]}"; do
+        pkill -9 -x "$n" 2>/dev/null || true
+    done
+    wait_until_idle 15 build_procs_running \
+        || echo "  [Locks] WARNING: build processes are still alive after SIGKILL" >&2
+    return 0
+}
+
 clean_stale_locks() {
-    find .repo -name '*.lock' -delete 2>/dev/null || true
-    # Remove git locks that might have been left behind during clone/fetch
-    find kernel device hardware vendor -type f -name '*.lock' -path '*/.git/*' -delete 2>/dev/null || true
-    rm -f out/.ninja_lock out/soong/.soong.in_use out/.lock 2>/dev/null || true
+    clean_git_locks
+    clean_out_locks
+}
+
+# =============================================================================
+# TREE-REMOVAL SAFETY
+# =============================================================================
+# rm -rf is only ever run on "<device|vendor|hardware|kernel>/<name>[/...]" paths that:
+#   - are relative, have no empty / "." / ".." components and only [A-Za-z0-9._-] characters
+#   - resolve (symlinks included) to exactly <source root>/<path>
+is_safe_tree_path() {
+    local p="${1%/}" root real part
+    local -a parts
+    [[ -n "$p" && "$p" != /* && "$p" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+    IFS=/ read -r -a parts <<< "$p"
+    (( ${#parts[@]} >= 2 )) || return 1
+    case "${parts[0]}" in
+        device|vendor|hardware|kernel) ;;
+        *) return 1 ;;
+    esac
+    for part in "${parts[@]}"; do
+        [[ -z "$part" || "$part" == "." || "$part" == ".." ]] && return 1
+    done
+    root=$(realpath -- "$PWD") || return 1
+    real=$(realpath -m -- "$p") || return 1
+    [[ "$real" == "$root/$p" ]]
+}
+
+safe_remove_tree() {
+    if ! is_safe_tree_path "$1"; then
+        echo "  [Foreign Tree] REFUSING to remove '$1' (not a plain device/vendor/hardware/kernel subpath)" >&2
+        return 1
+    fi
+    rm -rf -- "${1%/}"
+}
+
+# Paths the ROM manifest itself manages (from `repo list`). Anything in here is never "foreign".
+declare -A ROM_PROJECTS=()
+load_rom_project_paths() {
+    ROM_PROJECTS=()
+    command -v repo >/dev/null 2>&1 && [[ -d .repo ]] || return 0
+    local line
+    while IFS= read -r line; do
+        line="${line%/}"
+        [[ -n "$line" ]] && ROM_PROJECTS["$line"]=1
+    done < <(repo list -p 2>/dev/null)
+}
+
+is_rom_managed_path() {
+    local t="${1%/}" r
+    for r in "${!ROM_PROJECTS[@]}"; do
+        [[ "$r" == "$t" || "$r" == "$t"/* || "$t" == "$r"/* ]] && return 0
+    done
+    return 1
 }
 
 # =============================================================================
@@ -630,6 +784,14 @@ start_build_process() {
         done < "$last_trees_file"
     fi
 
+    # 2b. Drop the previous run's local manifests first: otherwise its device trees would show up
+    # in `repo list` below and look "ROM-managed". They are wiped on every run anyway (STEP 1).
+    if [[ -d ".repo/local_manifests" ]]; then
+        echo "  [Foreign Tree] Removing: .repo/local_manifests/"
+        rm -rf ".repo/local_manifests"
+    fi
+    load_rom_project_paths
+
     # 3. Safely execute removal of confirmed foreign trees
     local foreign_removed=0
     step_start
@@ -657,9 +819,19 @@ start_build_process() {
             continue
         fi
 
+        # Dynamic protection: anything the ROM manifest itself manages is never "foreign"
+        if is_rom_managed_path "$fpath"; then
+            echo "  [Foreign Tree] Keeping $fpath (managed by the ROM manifest)"
+            continue
+        fi
+
         if [[ -e "$fpath" ]]; then
+            if ! is_safe_tree_path "$fpath"; then
+                echo "  [Foreign Tree] REFUSING to remove '$fpath' (not a plain device/vendor/hardware/kernel subpath)" >&2
+                continue
+            fi
             echo "  [Foreign Tree] Removing: $fpath (foreign to ${DEVICE_CODE})"
-            rm -rf "$fpath"
+            rm -rf -- "${fpath%/}"
             foreign_removed=$((foreign_removed + 1))
 
             # Clean up empty parent directories if any
@@ -671,11 +843,7 @@ start_build_process() {
         fi
     done
 
-    # 4. Remove .repo/local_manifests — may reference old device repos
-    if [[ -d ".repo/local_manifests" ]]; then
-        echo "  [Foreign Tree] Removing: .repo/local_manifests/"
-        rm -rf ".repo/local_manifests"
-    fi
+    # 4. (.repo/local_manifests is already removed in step 2b)
 
     # 5. If the device changed, reset dirty git state in ROM repos
     if [[ -f "$last_device_file" ]]; then
@@ -772,7 +940,7 @@ start_build_process() {
         if [[ -n "${KEYS_REPO:-}" && -n "${KEYS_DIR:-}" ]]; then
             if [ -d "$KEYS_DIR" ]; then
                 log_status "Cloning Trees 🌲" "Wiping old keys folder (${KEYS_DIR})..."
-                rm -rf "$KEYS_DIR"
+                safe_remove_tree "$KEYS_DIR" || die "Refusing to wipe unsafe KEYS_DIR '${KEYS_DIR}'"
             fi
             smart_clone "$KEYS_REPO" "${KEYS_BRANCH:-master}" "$KEYS_DIR" "signing keys"
         fi
@@ -844,7 +1012,7 @@ start_build_process() {
         log_status "Building 🔨" "Starting module ${module_index}/${total_modules}: ${target_module}..."
         step_start
 
-        clean_stale_locks
+        clean_out_locks
         rm -f out/build.log out/.build_start_marker
         touch out/.build_start_marker
         sleep 1
@@ -888,8 +1056,9 @@ start_build_process() {
                     echo "[VOLT_STALL] No log activity & CPU idle for $((inactive_sec/60)) mins! Re-initializing..."
 
                     kill -9 -"$BUILD_PID" 2>/dev/null || kill -9 "$BUILD_PID" 2>/dev/null || true
-                    sleep 3
-                    clean_stale_locks
+                    wait "$BUILD_PID" 2>/dev/null || true
+                    stop_leftover_build_procs
+                    clean_out_locks
 
                     mka installclean 2>/dev/null || true
                     set +u
