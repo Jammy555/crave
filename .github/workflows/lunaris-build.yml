@@ -259,7 +259,9 @@ jobs:
   # ═══════════════════════════════════════════════════════════════════════
   build:
     name: "Build LunarisOS"
-    timeout-minutes: 1440
+    # Queue wait counts toward this limit. 1440 (24h) cut a build that had waited ~23h20m in
+    # Crave's queue. Raise/lower to taste (self-hosted jobs can run for days).
+    timeout-minutes: 4320
     needs: [runner-setup, validate]
     runs-on: self-hosted
     concurrency:
@@ -773,7 +775,7 @@ jobs:
           rm -f "$MSG_STATE_FILE" "$STOP_RETRY_USED_FILE"
           exit $EXIT_CODE
         done
-      timeout-minutes: 1440
+      timeout-minutes: 4320
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -784,19 +786,47 @@ jobs:
         CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
         CRAVE_TEAM_ID: ${{ secrets.CRAVE_TEAM_ID }}
 
-    - name: Stop crave on cancel
+    - name: Report crave job state on cancel/timeout
       if: ${{ cancelled() }}
       run: |
-        cd "$PROJECTFOLDER" && crave stop --all
+        # cancelled() is also true when GitHub hits timeout-minutes, so this does NOT mean a
+        # human pressed Cancel. This step used to run `crave stop --all`, which is what killed
+        # a build that had waited ~23h in Crave's queue. It now leaves the Crave job alone and
+        # reports what Crave says the job is doing. Stop a job on purpose with the Telegram
+        # Stop button, or `crave stop <jobId>` in the devspace.
+        cd "$PROJECTFOLDER" 2>/dev/null || true
+        STATE_FILE="${PROJECTFOLDER}/.crave_tracked_job.json"
+        TEAM_ID="${CRAVE_TEAM_ID:-14}"
+        JOB_ID=$(jq -r '.jobId // empty' "$STATE_FILE" 2>/dev/null || true)
 
-        # This is a workflow-level cancellation from the GitHub UI, not the
-        # Telegram Stop button — monitor.sh is already gone by this point,
-        # so this is a simple best-effort notice, not the unified message.
-        # NOTE: auto-restart isn't wired up for this path — it would need a
-        # workflow_dispatch re-trigger via the GitHub API. Ask if you want
-        # that added.
-        MSG="$(printf '🛑 <b>Workflow Cancelled</b>\n\nCancelled from GitHub Actions — crave job stopped.\nCommand: <code>%s</code>' \
-          "${INPUT_BUILD_COMMAND:-bacon}")"
+        # Let the runner's own cleanup (it kills this job's local processes) finish first,
+        # then ask Crave's API what the server-side job is doing now.
+        sleep 10
+        JOB_STATUS="unknown"
+        if [[ -n "$JOB_ID" && -n "${CRAVE_TOKEN:-}" ]]; then
+          RESP=$(curl -s -m 20 -X POST "https://foss.crave.io/api/job/v1/get" \
+            -H "Authorization: ${CRAVE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"action\":\"list\",\"page\":1,\"limit\":150,\"sort\":{\"jobId\":\"desc\"},\"filter\":{\"type\":\"batch\",\"teamId\":${TEAM_ID}},\"searchKeyword\":{}}" \
+            2>/dev/null || true)
+          if echo "$RESP" | jq -e '.success' &>/dev/null; then
+            JOB_STATUS=$(echo "$RESP" | jq -r --argjson jid "$JOB_ID" \
+              '.data.content[]? | select(.jobId==$jid) | .status' 2>/dev/null | head -1)
+            JOB_STATUS="${JOB_STATUS:-not found}"
+          fi
+        fi
+
+        CMD="${INPUT_BUILD_COMMAND:-bacon}"
+        if [[ -z "$JOB_ID" ]]; then
+          DETAIL="No tracked Crave job id was saved, so I can't tell what the job is doing. Check <code>crave list</code> in the devspace."
+        elif [[ "$JOB_STATUS" == "queued" || "$JOB_STATUS" == "running" ]]; then
+          DETAIL="$(printf 'Crave job <b>#%s</b> is still <b>%s</b> — it was NOT stopped.\nRe-run the workflow to find it again, or stop it yourself with the Stop button / <code>crave stop %s</code>.' "$JOB_ID" "$JOB_STATUS" "$JOB_ID")"
+        else
+          DETAIL="$(printf 'Crave job <b>#%s</b> status: <b>%s</b>.' "$JOB_ID" "$JOB_STATUS")"
+        fi
+
+        MSG="$(printf '🛑 <b>Workflow stopped by GitHub</b>\n\nCancelled or hit the job time limit (this run: %s).\nCommand: <code>%s</code>\n\n%s' \
+          "$RUN_URL" "$CMD" "$DETAIL")"
         curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
           -d "parse_mode=HTML" \
@@ -805,3 +835,6 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         INPUT_BUILD_COMMAND: ${{ github.event.inputs.BUILD_COMMAND }}
+        CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
+        CRAVE_TEAM_ID: ${{ secrets.CRAVE_TEAM_ID }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
